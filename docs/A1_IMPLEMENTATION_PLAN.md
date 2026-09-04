@@ -1,10 +1,18 @@
-# Assignment 1 implementation plan (no code yet)
+# Assignment 1 implementation plan and progress
 
-This plan translates the architecture in `A1_DESIGN.md` into a Rust/WASM switch program. None of these program files have been created in Phase 1.
+This plan translates the architecture in `A1_DESIGN.md` into the completed Rust/WASM switch program. Detailed implementation and test evidence is in `A1_IMPLEMENTATION_LOG.md`.
+
+## Progress snapshot
+
+- Foundation crate, TinyVM pipeline, protocol codec, state model, topology graph, BFS routing, and route diffs: **complete**.
+- Native unit tests: **15/15 passing**.
+- Part 1 practice worlds: **5/5 passing with 100% scored delivery and zero loops**.
+- Part 2 failure schedules: **15/15 passing; all 180 events recover, worst case 148 ms**.
+- Hardening, final build, repository test suite, and documentation reconciliation: **complete**.
 
 ## Files to create or modify in the implementation phase
 
-Create a standalone crate outside the simulator workspace, following the examples:
+The implementation uses this standalone crate outside the simulator workspace:
 
 ```text
 a1_switch/
@@ -17,9 +25,9 @@ a1_switch/
 
 Optional test-only files may be added under `a1_switch/tests/` if integration tests are easier to keep separate. The existing simulator, SDK, scorer, worlds, failure schedules, and their tests must not be modified.
 
-`a1_switch/Cargo.toml` should opt out of the parent workspace with `[workspace]`, build a `cdylib`, use edition 2024, point to `../switch_program_sdk`, and use the small release profile from `examples/hello_switch`.
+`a1_switch/Cargo.toml` opts out of the parent workspace with `[workspace]`, builds a `cdylib` and `rlib`, uses edition 2024, points to `../switch_program_sdk`, and uses the small release profile from `examples/hello_switch`.
 
-The only Phase 1 changes are these documentation files:
+The original Phase 1 changes were these documentation files:
 
 - `docs/A1_DESIGN.md`
 - `docs/A1_IMPLEMENTATION_PLAN.md`
@@ -228,7 +236,7 @@ Use the detailed matrix in `A1_TEST_PLAN.md`. The short order is:
 
 ## Completion criteria for the implementation phase
 
-The implementation is ready only when:
+The implementation is ready when:
 
 - all five Part 1 report cards pass C1 and C2, ideally with zero C3 loops;
 - all 15 Part 2 schedules pass every C4 event, including restorations;
@@ -237,3 +245,4 @@ The implementation is ready only when:
 - the docs have been updated from proposed to actual behavior;
 - Git status contains only intentional program, test, and documentation changes.
 
+All required criteria above are satisfied on the supplied material. C3 is zero on all Part 1 worlds and 13 Part 2 schedules; the remaining two contain only brief advisory convergence loops, documented in `A1_IMPLEMENTATION_LOG.md`.

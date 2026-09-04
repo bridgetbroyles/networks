@@ -2,10 +2,11 @@
 
 Guides included in this kit:
 
-Assignment 1 planning documents (pre-implementation):
+Assignment 1 design, implementation, and verification documents:
 
 - [A1_DESIGN.md](A1_DESIGN.md)
 - [A1_IMPLEMENTATION_PLAN.md](A1_IMPLEMENTATION_PLAN.md)
+- [A1_IMPLEMENTATION_LOG.md](A1_IMPLEMENTATION_LOG.md)
 - [A1_QUIZ_GUIDE.md](A1_QUIZ_GUIDE.md)
 - [A1_TEST_PLAN.md](A1_TEST_PLAN.md)
 

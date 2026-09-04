@@ -1,0 +1,5 @@
+# Rust build output is reproducible and must not be committed.
+target/
+
+# Simulator replays are local test artifacts unless deliberately moved.
+*.simlog

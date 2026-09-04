@@ -1,6 +1,6 @@
-# Assignment 1 quiz guide (proposed design)
+# Assignment 1 quiz guide (current implementation)
 
-This guide explains the planned implementation in student-friendly terms. It must be revised after coding so every statement describes the **actual** submitted program.
+This guide explains the verified implementation in `a1_switch/` in student-friendly terms. Its behavior has been checked against all five Part 1 worlds and all 15 Part 2 failure schedules.
 
 ## The one-sentence story
 
@@ -95,7 +95,7 @@ One endpoint may have heard a HELLO while the other has not yet done so, or one 
 
 The simulator appends table entries; matching entry IDs are not automatic replacements. Deleting first prevents an older route to the same destination from remaining in front of the new one.
 
-### Why did recovery take about 100–125 ms?
+### Why did recovery take about 100–150 ms?
 
 The link failed silently. The program waited until HELLO silence crossed the 100 ms timeout, advertised the change, then waited for the next periodic computation after the short stability hold. Nothing directly told it “link down.”
 
@@ -157,7 +157,7 @@ Both entries remain. Depending on table order/priority, the old port can continu
 
 ### If a packet briefly loops during convergence
 
-Every switch ingress decrements TTL, so it eventually dies rather than looping forever. The design's stability hold, mutual links, and failed-next-hop withdrawal aim to avoid this; after LSDB convergence, shortest-path distance strictly decreases and a persistent loop is impossible.
+Every switch ingress decrements TTL, so it eventually dies rather than looping forever. The design's stability hold, mutual links, and failed-next-hop withdrawal keep this rare; after LSDB convergence, shortest-path distance strictly decreases and a persistent loop is impossible. This happened to six packets in each of two supplied Part 2 schedules; the other 13 schedules observed no loop.
 
 ## Small topology drills
 
@@ -220,4 +220,4 @@ If the question concerns an exact timestamp, remember the config and punt pipes,
 - Every DOWN and UP event has a 1,000 ms recovery budget.
 - C2 requires every ordered app pair.
 - C3 loops are advisory in A1, not permission to ignore them.
-
+- Supplied results: Part 1 is 5/5 with 100% scored delivery; Part 2 is 15/15 with worst recovery 148 ms.

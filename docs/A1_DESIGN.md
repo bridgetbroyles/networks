@@ -1,18 +1,18 @@
-# Assignment 1 design (pre-implementation)
+# Assignment 1 design and implementation architecture
 
-This document records the proposed design for Assignment 1. It is deliberately a plan, not an implementation. After the switch is built, this file and `A1_QUIZ_GUIDE.md` should be checked against the actual code and updated wherever the implementation differs.
+This document describes the architecture implemented in `a1_switch/`. The final release WASM passes every supplied Part 1 world and all 15 supplied Part 2 failure schedules.
 
 ## Executive summary
 
-Each switch will run the same small link-state routing program.
+Each switch runs the same small link-state routing program.
 
-- The TinyVM data plane will punt one reserved control protocol and otherwise perform one exact destination-address lookup.
-- The Rust controller will discover switch neighbors with periodic one-hop `HELLO` messages.
-- It will learn locally attached customer addresses from ordinary packets arriving on ports that never answer a hello.
-- Every switch will originate a versioned link-state advertisement (LSA) containing its currently live switch neighbors and its locally learned customer addresses.
-- New LSAs will be flooded hop by hop. A slow rotating anti-entropy exchange will repair a missed advertisement without creating a control storm.
-- Each switch will compute deterministic unit-cost shortest paths over links that both endpoints currently advertise, then install one route per learned customer address.
-- Missing hellos will withdraw a link; continued probes will rediscover a restored link. Sequence numbers reject stale LSAs.
+- The TinyVM data plane punts one reserved control protocol and otherwise performs one exact destination-address lookup.
+- The Rust controller discovers switch neighbors with periodic one-hop `HELLO` messages.
+- It learns locally attached customer addresses from ordinary packets arriving on ports that never answer a hello.
+- Every switch originates a versioned link-state advertisement (LSA) containing its currently live switch neighbors and its locally learned customer addresses.
+- New LSAs are flooded hop by hop. A slow rotating anti-entropy exchange repairs a missed advertisement without creating a control storm.
+- Each switch computes deterministic unit-cost shortest paths over links that both endpoints currently advertise, then installs one route per learned customer address.
+- Missing hellos withdraw a link; continued probes rediscover a restored link. Sequence numbers reject stale LSAs.
 
 This is intentionally not BGP, spanning-tree forwarding, or a distance-vector protocol. A1 is a single-owner network of at most 15 switches with no routing policy. A complete topology database is small, shortest paths are easy to explain, and a 100 ms liveness timeout is far inside the 1,000 ms recovery budget.
 
@@ -28,7 +28,7 @@ The repository, especially [`switch-programs.md`](switch-programs.md), [`switch_
 6. `ScheduleTimer { delay_ns }` is a relative delay. The request itself traverses the config pipe; the new timer is scheduled relative to the time the action arrives, so a nominal periodic timer drifts slightly.
 7. `InjectPacket` chooses an attached local egress port and supplies source/destination IP, protocol, TTL, kind, size, and payload. The SDK's `inject_packet` helper creates a `Data` packet whose nominal size is 20 bytes plus payload. Injection traverses the config pipe and then the ordinary link, consuming bandwidth.
 8. Control messages are ordinary packets. The receiver gets them only if TinyVM punts them. Their payload is opaque to TinyVM and readable by `on_punt`.
-9. Customer traffic in the supplied worlds uses IP protocol 0. The proposed program reserves protocol 253, a non-customer destination address, a magic value, and a message version for its own control traffic. A first-stage exact table punts that protocol before destination routing. `PuntEvent` does not contain `PacketKind`, so protocol plus validated payload is the reliable controller-visible discriminator.
+9. Customer traffic in the supplied worlds uses IP protocol 0. The implementation reserves protocol 253, a non-customer destination address, a magic value, and a message version for its own control traffic. A first-stage exact table punts that protocol before destination routing. `PuntEvent` does not contain `PacketKind`, so protocol plus validated payload is the reliable controller-visible discriminator.
 10. TinyVM tables are ordered vectors. Exact tables try entries by descending priority; LPM tables use longest prefix then priority. The first match applies its action immediately. A miss simply falls through. If the whole pipeline ends without an egress, the simulator punts with `NoRoute`.
 11. Tables and their capacities are declared in `init`; initial entries may be added there. Later installs/deletes are asynchronous controller actions through the config pipe. Installing an entry appends it; it does not replace an existing entry with the same ID. Deleting an ID removes every entry with that ID. The implementation must therefore diff routes, delete a changed entry before reinstalling it, and never reinstall unchanged routes.
 12. A punt reveals a packet's source and destination addresses but not either prefix length. In the supplied worlds, every app owns a `/24` but sends from and receives at the prefix's first host. The only topology-independent fact learnable through the student API is the observed host address. The design advertises and installs that address as `/32`; that is sufficient for the actual workload builder and avoids inventing an unknowable prefix length.
@@ -48,7 +48,7 @@ Two source-level details are worth remembering:
 
 ## Data plane
 
-The proposed data plane has two small exact-match tables and two stages.
+The data plane has two small exact-match tables and two stages.
 
 ### Control table
 
@@ -69,7 +69,7 @@ No registers, counters, labels, recirculation, queue changes, or trace machinery
 
 ## Control-plane state
 
-Each WASM instance will maintain bounded Rust collections rather than arrays indexed by switch ID.
+Each WASM instance maintains bounded Rust collections rather than arrays indexed by switch ID.
 
 - `switch_id` and `local_ports` from `init`.
 - Per-port state: role (`Unknown`, `SwitchNeighbor`, or `Customer`), neighbor ID if known, last accepted hello time, liveness, first ordinary packet time, and candidate customer addresses.
@@ -81,11 +81,11 @@ Each WASM instance will maintain bounded Rust collections rather than arrays ind
 - The desired and currently installed route for each customer address.
 - A rotating cursor used to send one LSDB record per periodic anti-entropy round.
 
-All lists placed on the wire will be sorted and deduplicated. Deterministic collections and tie-breaking make identical topology views produce identical decisions.
+All lists placed on the wire are sorted and deduplicated. Deterministic collections and tie-breaking make identical topology views produce identical decisions.
 
 ## Control messages
 
-The program will use a small checked binary format rather than expose Rust memory layouts.
+The program uses a small checked binary format rather than expose Rust memory layouts.
 
 ### Common header
 
@@ -123,7 +123,7 @@ When a customer port is confirmed, every observed source address on it is added 
 
 The LSDB describes directed claims: origin `A` says that `B` is live. Routing treats `A-B` as usable only when both the latest LSA from `A` lists `B` and the latest LSA from `B` lists `A`. This mutual-adjacency rule avoids routing over a half-discovered or one-sided stale link.
 
-Customer address ownership is derived from the customer list in each latest LSA. The supplied worlds guarantee disjoint prefixes and one app per switch. If malformed information claims the same address at multiple origins, the implementation will choose the lowest origin switch ID so every switch with the same LSDB resolves the conflict identically.
+Customer address ownership is derived from the customer list in each latest LSA. The supplied worlds guarantee disjoint prefixes and one app per switch. If malformed information claims the same address at multiple origins, the implementation chooses the lowest origin switch ID so every switch with the same LSDB resolves the conflict identically.
 
 ## Route computation
 
@@ -180,7 +180,7 @@ The design uses several independent safeguards.
 - Failed next-hop routes are deleted before an alternate is installed.
 - Ingress TTL decrement bounds any transient inconsistency that does occur.
 
-The design guarantees no persistent forwarding loop after the LSDB settles. Like ordinary distributed link-state routing, it cannot make all switches update atomically, so a very short transient loop is theoretically possible while config-pipe updates arrive. The hold and break-before-make behavior make that window small; the report card also treats C3 as advisory in A1, though the implementation should still aim for zero loop observations.
+The design guarantees no persistent forwarding loop after the LSDB settles. Like ordinary distributed link-state routing, it cannot make all switches update atomically, so a very short transient loop is possible while config-pipe updates arrive. Thirteen of the 15 Part 2 schedules observed none. Two schedules each observed six packets revisit a switch during convergence; the loops cleared immediately, all required criteria passed, and settled next hops again strictly reduced distance. Avoiding even this transient would require a more complex ordered-update protocol whose extra states and delay are not justified by A1's advisory C3 criterion.
 
 ## Resource use
 
@@ -192,7 +192,7 @@ The design guarantees no persistent forwarding loop after the LSDB settles. Like
 - A normal timer emits at most one HELLO plus one anti-entropy LSA per switch-facing port, plus one timer request. Anti-entropy is skipped on a timer that has a large route diff. This keeps the postcard-encoded action vector comfortably below 4,096 bytes even at high degree.
 - Control packets are small and the practice workload uses only a tiny fraction of 1 Gbps. Control traffic is not scored, but it still uses the shared links.
 
-All decoders and loops will have explicit bounds. No handler will wait, recurse, or iterate on data supplied without a size check.
+All decoders and loops have explicit bounds. No handler waits, recurses, or iterates on control-payload list data without a size check.
 
 ## Alternatives considered
 
@@ -218,9 +218,8 @@ All published apps use `/24`, but `PuntEvent` never reveals that length. Adverti
 
 ## Assumptions and open uncertainties
 
-- The repository itself states in `README.md` that the instructor handout is not included. No handout file exists in this checkout or the task's initial directory. This plan therefore relies on the user's stated requirements plus the executable scorer. The handout should be checked before implementation for any rule not encoded here, especially whether students are expected to forward every address within a customer prefix rather than only workload destinations.
-- The docs say the TinyVM program is validated after `init`, but the current `load_program`/`install_program` path does not visibly call `tinyvm::validate`. The planned TinyVM is valid under the documented limits and will not rely on this discrepancy.
+- The repository itself states in `README.md` that the instructor handout is not included. No handout file exists in this checkout or the task's initial directory. The implementation therefore follows the user's stated requirements plus the executable scorer. The remaining external check is whether the handout requires forwarding every address within a customer prefix rather than the observable workload host address.
+- The docs say the TinyVM program is validated after `init`, but the current `load_program`/`install_program` path does not visibly call `tinyvm::validate`. The implemented two-stage program is within the documented limits and does not rely on this discrepancy.
 - General simulator controllers have `on_link_event`, but A1 disables notifications and the SDK trait deliberately omits it. The design does not rely on it.
 - The practice schedules contain one failed link at a time and guarantee connectivity. The protocol can process multiple independent link losses if the remaining graph stays connected, but that is not the primary tested promise.
 - Switch/CPU failures are implemented by the simulator but do not appear in A1 failure schedules. This design addresses link failures, not a permanently failed node or controller.
-

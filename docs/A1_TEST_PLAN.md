@@ -1,6 +1,6 @@
-# Assignment 1 test plan
+# Assignment 1 test plan and results
 
-This plan is for the future Rust/WASM implementation. Phase 1 does not build or run a student switch.
+This document combines the test strategy with verified results. Part 1 and Part 2 supplied matrices are complete. Command-level details and failures are recorded in `A1_IMPLEMENTATION_LOG.md`.
 
 ## Test objectives
 
@@ -25,7 +25,7 @@ Before implementation testing:
 4. Run the repository's existing test suite before student-code changes.
 5. Confirm Git is clean except for intentional documentation/program work.
 
-The current Phase 1 shell environment does not have `cargo` on `PATH`, so this preflight could not yet be completed. That is an environment issue, not a repository test result.
+A temporary Rust 1.98.1 toolchain with `wasm32-unknown-unknown` was provisioned under `/private/tmp`. The simulator release build, the A1 native tests, the A1 release WASM build, and the repository's tests all pass when run in their expected target locations. The test suite's hard-coded normal target-path assumption is documented in `A1_IMPLEMENTATION_LOG.md`.
 
 ## Unit tests inside the program crate
 
@@ -161,6 +161,8 @@ Run the smallest world first, then sweep all five. A correct Part 1 report shoul
 - C4 `n/a` because no link event occurred;
 - no `WHERE PACKETS STOPPED`, `WHAT WENT WRONG`, `INTEGRITY`, or program-failure section for scored traffic.
 
+Verified on 2026-09-04: all five worlds meet these conditions. Every C1 result is 100.00% with zero scored losses, C2 is complete (30, 42, 90, 156, and 210 ordered pairs respectively), and every C3 result is zero.
+
 Inspect startup separately with a shorter run/log; a perfect unscored total is not expected because learning punts are discarded.
 
 ## Part 2 failure matrix
@@ -189,6 +191,8 @@ For every run, success means:
 - restored links are actually rediscovered and may be selected again.
 
 Do not test only failures with small blast radius. The dumbbell and large-ring schedules are especially valuable because one wrong next hop affects many source/destination pairs.
+
+Verified on 2026-09-04: all 15 schedules pass C1, C2, and C4. C1 ranges from 99.38% to 99.59%; all 180 DOWN/UP events recover within budget; the worst observed recovery is 148 ms. Thirteen schedules have zero C3 loops. `part2-grid-003-f002` and `part2-dumb-006-f003` each observed six transient revisits during convergence, but no persistent loop and no required-criterion failure.
 
 ## Focused behavior checks
 
@@ -258,7 +262,7 @@ For any suspicious run, keep a named `.simlog` rather than relying on the tempor
 
 The generic log does not include control payload bytes, so detailed HELLO/LSA decoding may require temporary, bounded debug state/tests. Do not modify the simulator log schema for the assignment.
 
-## Suggested command sequence for implementation phase
+## Reproducible verification command sequence
 
 After choosing `PROGRAM` as the built WASM path:
 
@@ -282,7 +286,7 @@ for schedule in worlds/practice/failures/*.toml; do
 done
 ```
 
-The final sweep should be rerun from a clean release build. Save at least one passing Part 1 and one demanding Part 2 log for quiz review.
+The final sweep was rerun from the final release build with a unique log path per run. Unique paths matter when schedules for one world run concurrently because automatic score-log names are world-based. Local logs under `/private/tmp/a1-final-*.simlog` preserve all five Part 1 and 15 Part 2 runs for quiz review during this session.
 
 ## Hidden-world risk tests
 
@@ -300,4 +304,3 @@ Before submission, add local tests for conditions not strongly represented by th
 - a customer prefix length other than `/24`, confirming exact first-host routing still serves generated workloads.
 
 The key hidden-world defense is to derive everything from observed ports, HELLOs, LSAs, and packet addresses rather than published IDs, filenames, topology families, failure times, or port 100.
-

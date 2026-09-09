@@ -1,225 +1,170 @@
-# Assignment 1 design and implementation architecture
+# Assignment 1 design: implemented architecture
 
-This document describes the architecture implemented in `a1_switch/`. The final release WASM passes every supplied Part 1 world and all 15 supplied Part 2 failure schedules.
+This document describes the code currently in `a1_switch/`. The design has been validated on all five supplied Part 1 worlds, all 15 supplied Part 2 schedules, and a separate rapid-change replay.
 
-## Executive summary
+## Architecture at a glance
 
-Each switch runs the same small link-state routing program.
+Every switch runs the same Rust/WASM program. It uses link-state routing plus a small ordered-update protocol.
 
-- The TinyVM data plane punts one reserved control protocol and otherwise performs one exact destination-address lookup.
-- The Rust controller discovers switch neighbors with periodic one-hop `HELLO` messages.
-- It learns locally attached customer addresses from ordinary packets arriving on ports that never answer a hello.
-- Every switch originates a versioned link-state advertisement (LSA) containing its currently live switch neighbors and its locally learned customer addresses.
-- New LSAs are flooded hop by hop. A slow rotating anti-entropy exchange repairs a missed advertisement without creating a control storm.
-- Each switch computes deterministic unit-cost shortest paths over links that both endpoints currently advertise, then installs one route per learned customer address.
-- Missing hellos withdraw a link; continued probes rediscover a restored link. Sequence numbers reject stale LSAs.
+- The TinyVM data plane punts reserved control packets and otherwise performs one exact destination lookup.
+- The Rust control plane discovers neighbors with HELLOs and learns local customer addresses from ordinary no-route punts.
+- Each switch floods a versioned LSA containing its live neighbors and local customers.
+- All switches compute deterministic shortest paths over mutually advertised links.
+- Before changing FIBs, switches agree on an identical routing view. The lowest-ID switch in the connected component coordinates distance-ordered update phases.
+- Missing HELLOs detect a silent failure. HELLOs continue on down ports, so their return detects recovery.
 
-This is intentionally not BGP, spanning-tree forwarding, or a distance-vector protocol. A1 is a single-owner network of at most 15 switches with no routing policy. A complete topology database is small, shortest paths are easy to explain, and a 100 ms liveness timeout is far inside the 1,000 ms recovery budget.
+Link state is a good fit because A1 is one administrative network with at most 15 switches, unit-cost links, no routing policy, and a complete topology small enough to replicate everywhere.
 
-## What the simulator actually exposes
+## Simulator contract that drives the design
 
-The repository, especially [`switch-programs.md`](switch-programs.md), [`switch_program_sdk/src/lib.rs`](../switch_program_sdk/src/lib.rs), [`switch_program_types/src/lib.rs`](../switch_program_types/src/lib.rs), [`sim.rs`](../src/sim.rs), [`world.rs`](../src/world.rs), and [`score.rs`](../src/score.rs), establishes the following contract.
+1. `init(switch_id, local_ports)` runs once per switch. It reveals only the switch's ID and attached local port numbers, not remote endpoints or port roles.
+2. The control plane runs only for `PuntEvent` and requested `TimerEvent` callbacks.
+3. `PuntEvent` exposes time, switch and ingress port, punt reason, packet size, source/destination IP, IP protocol, TTL, and payload. It does not expose app identity, packet kind, path, or customer prefix length.
+4. `TimerEvent` exposes only simulated nanoseconds. Timer requests are relative and travel through the configuration pipe.
+5. Injected control packets use a chosen local egress port and consume ordinary link/queue capacity.
+6. Table installs and deletes are asynchronous configuration actions. Install appends; it does not replace an entry with the same ID. A changed route must therefore be deleted before replacement.
+7. A failed A1 link silently drops new enqueues. Already queued packets may drain, and no link event is delivered to the student program.
+8. Recovery is silent too. Only traffic that starts crossing again reveals it.
+9. A1 links are bidirectional, with shared FIFO/drop-tail serialization. Switch ingress decrements packet TTL before TinyVM runs.
+10. The controller output limit is 4,096 encoded bytes per callback and the WASM instruction limit is 4,000,000 per callback. Table and TinyVM limits are also bounded.
+11. Practice traffic starts at time zero, sends every 10 ms, and rotates destinations. Scoring excludes the first 200 ms and final 100 ms.
+12. C1 requires 99.9% Part 1 or 98% Part 2 delivery, C2 requires every ordered app pair, and C4 requires recovery within 1,000 ms after every DOWN and UP event. C3 reports loops and is advisory for A1.
 
-1. `init(switch_id, local_ports)` runs once for every owned switch when the WASM module is installed. It returns both the TinyVM program and all table/register/counter declarations.
-2. At startup the program knows its own `u32` switch ID and the sorted, deduplicated `u16` IDs of ports with links. It is not told the remote endpoint, which ports face customers, the topology, customer IDs, IPs, or prefix lengths.
-3. The controller executes only on a punt or a timer. The CLI schedules one initial timer at simulation time zero. Every later timer must be requested by the program.
-4. `PuntEvent` contains exactly: `now_ns`, `switch_id`, `ingress_port`, `reason`, `packet_size`, `ip_src`, `ip_dst`, `ip_proto`, `ip_ttl`, and the opaque `payload` bytes. It does **not** expose packet kind, DSCP, transport ports, app ID, flow ID, custom fields, labels, packet ID, or the hidden path trail.
-5. `TimerEvent` contains only `now_ns`.
-6. `ScheduleTimer { delay_ns }` is a relative delay. The request itself traverses the config pipe; the new timer is scheduled relative to the time the action arrives, so a nominal periodic timer drifts slightly.
-7. `InjectPacket` chooses an attached local egress port and supplies source/destination IP, protocol, TTL, kind, size, and payload. The SDK's `inject_packet` helper creates a `Data` packet whose nominal size is 20 bytes plus payload. Injection traverses the config pipe and then the ordinary link, consuming bandwidth.
-8. Control messages are ordinary packets. The receiver gets them only if TinyVM punts them. Their payload is opaque to TinyVM and readable by `on_punt`.
-9. Customer traffic in the supplied worlds uses IP protocol 0. The implementation reserves protocol 253, a non-customer destination address, a magic value, and a message version for its own control traffic. A first-stage exact table punts that protocol before destination routing. `PuntEvent` does not contain `PacketKind`, so protocol plus validated payload is the reliable controller-visible discriminator.
-10. TinyVM tables are ordered vectors. Exact tables try entries by descending priority; LPM tables use longest prefix then priority. The first match applies its action immediately. A miss simply falls through. If the whole pipeline ends without an egress, the simulator punts with `NoRoute`.
-11. Tables and their capacities are declared in `init`; initial entries may be added there. Later installs/deletes are asynchronous controller actions through the config pipe. Installing an entry appends it; it does not replace an existing entry with the same ID. Deleting an ID removes every entry with that ID. The implementation must therefore diff routes, delete a changed entry before reinstalling it, and never reinstall unchanged routes.
-12. A punt reveals a packet's source and destination addresses but not either prefix length. In the supplied worlds, every app owns a `/24` but sends from and receives at the prefix's first host. The only topology-independent fact learnable through the student API is the observed host address. The design advertises and installs that address as `/32`; that is sufficient for the actual workload builder and avoids inventing an unknowable prefix length.
-13. A `HELLO` payload can identify the switch at the far end of the ingress port. There is no direct neighbor query.
-14. Hard limits are 4,000,000 WASM instructions per call; 4,096 encoded output bytes per call; 16 tables with 1,024 entries each; 16 register arrays and 16 counter arrays with 4,096 slots each. TinyVM's default validator limit is 64 instructions per stage and one distinct memory resource per stage.
-15. Time is deterministic simulated `Duration`, exposed to WASM as integer nanoseconds in `u64`. Events are ordered by time and then scheduling sequence. Link and pipe serialization delays use integer nanoseconds.
-16. Every physical link is bidirectional but has one shared FIFO/drop-tail serialization queue. Packets preserve enqueue order. A switch ingress decrements TTL before running TinyVM; a packet arriving with TTL zero is dropped. World links are 1 Gbps, 100 microseconds, and 65,536-byte queues unless overridden. A1 worlds do not override capacity.
-17. When a link fails, new enqueues in either direction are silently dropped. Packets already enqueued still arrive. `notify_link_events` defaults to false, A1 leaves it false, and the Rust SDK intentionally does not expose `on_link_event`.
-18. A restored link also generates no student-visible event. It can be detected only because continuously transmitted probes begin arriving again.
-19. A world assigns inter-switch ports densely from zero in link declaration order and attaches an app at port 100. Every practice A1 world has one app per switch. The design nevertheless discovers port roles and does not depend on port 100, dense switch IDs, or published topology order.
-20. The report card scores `Data` packets whose source and destination are both declared app addresses. It ignores sends before 200 ms and in the final 100 ms. C1 is delivery (99.9% Part 1, 98% Part 2), C2 requires every ordered app pair to deliver at least once, C3 reports loops but is advisory in A1, and C4 requires the last loss attributed to every DOWN and UP event to be no later than 1,000 ms after that event.
-
-Two source-level details are worth remembering:
-
-- A punted customer packet is already lost. Installing a route helps later packets; there is no SDK action that forwards the original packet with its identity intact.
-- The world sends one packet per app every 10 ms and rotates across destinations. It does not send to every peer every 10 ms.
+A punted customer packet cannot be rescued by an SDK action; learning helps later packets. Customer prefix length is not observable, so the implementation learns and routes each observed application address as `/32`.
 
 ## Data plane
 
-The data plane has two small exact-match tables and two stages.
-
-### Control table
-
-`T_CONTROL` is exact-match on `ip_proto`. It has one initial entry for protocol 253 whose action is `Punt(Custom(CONTROL_REASON))`. This prevents a control packet from accidentally matching a customer route.
-
-### Route table
-
-`T_ROUTE` is exact-match on `ip_dst`. Each installed entry maps one observed customer address to an egress port. A miss leaves no egress and therefore generates `PuntReason::NoRoute`.
-
-The pipeline is conceptually:
+There are two exact tables and two TinyVM stages:
 
 ```text
-stage 0: ip_proto -> T_CONTROL
-stage 1: ip_dst   -> T_ROUTE
+ip_proto -> T_CONTROL -> punt protocol 253
+ip_dst   -> T_ROUTE   -> set egress port
 ```
 
-No registers, counters, labels, recirculation, queue changes, or trace machinery are needed. The switch's automatic ingress TTL decrement supplies loop protection.
+`T_CONTROL` has one initial entry. Control payloads also require the `NA1!` magic, version 1, and a valid bounded encoding before they affect state. `T_ROUTE` has capacity 256 and uses the destination address as a stable entry ID. A route miss becomes `PuntReason::NoRoute`.
 
 ## Control-plane state
 
-Each WASM instance maintains bounded Rust collections rather than arrays indexed by switch ID.
+Each switch owns private state:
 
-- `switch_id` and `local_ports` from `init`.
-- Per-port state: role (`Unknown`, `SwitchNeighbor`, or `Customer`), neighbor ID if known, last accepted hello time, liveness, first ordinary packet time, and candidate customer addresses.
-- A monotonically increasing local hello sequence.
-- A monotonically increasing local LSA sequence.
-- The latest accepted LSA per origin switch.
-- The local map from customer address to customer-facing port.
-- The last time topology/customer information changed and a `routing_dirty` flag.
-- The desired and currently installed route for each customer address.
-- A rotating cursor used to send one LSDB record per periodic anti-entropy round.
+- per-port role, neighbor ID/liveness, last HELLO time and sequence, and candidate customers;
+- local HELLO and LSA sequence numbers;
+- latest LSA per origin (`lsdb`) and local customer-to-port mappings;
+- installed routes, including egress port and logical next-hop switch;
+- anti-entropy cursor and `routing_dirty`;
+- current 128-bit `ViewId`, readiness sequence, and readiness records;
+- active ordered update: leader, generation, view, maximum/completed phase, and desired routes;
+- leader-only update state: component members, current phase/attempt, acknowledgements, and last-send time;
+- newest generation seen per leader and newest flooded attempt per generation/phase.
 
-All lists placed on the wire are sorted and deduplicated. Deterministic collections and tie-breaking make identical topology views produce identical decisions.
+`BTreeMap`/`BTreeSet` avoid assuming dense switch IDs and make identical inputs produce identical encodings, hashes, leader choices, and paths.
 
 ## Control messages
 
-The program uses a small checked binary format rather than expose Rust memory layouts.
+All messages use a checked binary format and carry a common magic/version/type header.
 
-### Common header
+- `HELLO(sender, sequence)`: one-hop identity and liveness probe.
+- `LSA(origin, sequence, neighbors, customers)`: complete replacement snapshot for one origin.
+- `READY(sender, leader, sequence, view)`: states that the sender has exactly this LSDB view and is ready to update it.
+- `UPDATE_PHASE(leader, generation, view, phase, max_phase, attempt)`: starts or retries one ordered FIB phase.
+- `PHASE_ACK(sender, leader, generation, view, phase, attempt)`: confirms that the sender finished all local actions for that phase.
 
-- fixed magic bytes
-- format version
-- message type
+HELLO and LSA lists are canonicalized. Decoders reject malformed lengths and more than 64 list items before allocation. LSAs and phases flood across live neighbor ports. READY and ACK messages follow deterministic shortest paths toward the leader, reducing overhead.
 
-Any packet with the reserved protocol but a wrong magic, version, length, or count is ignored safely.
+## Discovery and LSDB maintenance
 
-### HELLO
+HELLOs are sent every 25 ms on unknown, live-switch, and down-switch ports. A valid new HELLO binds an ingress port to its neighbor. Equal or older HELLO sequence numbers cannot refresh liveness.
 
-Fields: immediate sender switch ID and hello sequence.
+An unknown port that supplies ordinary customer traffic becomes a candidate customer port. It is confirmed only after 50 ms without a HELLO. A later HELLO overrides that classification and withdraws mistaken local-customer state.
 
-HELLO is sent with TTL 1 on every unknown or switch-facing local port. It is not sent on a confirmed customer port. Receipt associates `ingress_port` with the sender, records the neighbor as live, and refreshes `last_hello_ns`.
+Each local neighbor/customer change increments the local LSA sequence and floods a complete snapshot. A receiver accepts only a strictly newer sequence for that origin. One rotating LSDB record per quiet timer provides anti-entropy; a newly discovered/recovered neighbor also receives a direct database sync.
 
-### LSA
-
-Fields: origin switch ID, origin sequence number, complete sorted list of currently live neighbor switch IDs, and complete sorted list of locally attached customer `/32` addresses.
-
-An LSA is a replacement snapshot, not an incremental add/remove. A receiver accepts only a sequence number strictly newer than its stored one, then floods the unchanged LSA on live switch ports except the ingress port. Equal and older LSAs are ignored. Self-origin LSAs received from the network are ignored.
-
-When a new or recovered adjacency appears, each endpoint immediately sends its own current LSA and a bounded database sync over that port. During ordinary operation, each timer sends one rotating LSDB record on every live switch port. With 15 origins and a 25 ms tick, every direct neighbor is refreshed within about 375 ms even if an earlier flood packet was lost.
-
-## Startup and neighbor/customer discovery
-
-At the first timer (time zero), the switch sends HELLO on all local ports and schedules the next timer.
-
-An ordinary punt on a known switch-facing port is never treated as evidence of a local customer. On an unknown port, its source address becomes a candidate. The port is classified as customer-facing only after candidate traffic has been observed and the port has remained without a valid HELLO for 50 ms. This is long compared with the sub-millisecond delivery of a practice-world hello and short compared with the 200 ms scoring warmup.
-
-If a HELLO later arrives on a port tentatively considered customer-facing, switch-neighbor evidence wins: candidate customer state on that port is withdrawn and a new local LSA is originated. This makes the classifier recover from a startup race instead of locking in a mistake.
-
-When a customer port is confirmed, every observed source address on it is added to the local customer map. The local LSA is replaced with a new sequence. Practice traffic begins at time zero and repeats every 10 ms, so every customer address should be observed well before scoring begins.
-
-## Building the topology
-
-The LSDB describes directed claims: origin `A` says that `B` is live. Routing treats `A-B` as usable only when both the latest LSA from `A` lists `B` and the latest LSA from `B` lists `A`. This mutual-adjacency rule avoids routing over a half-discovered or one-sided stale link.
-
-Customer address ownership is derived from the customer list in each latest LSA. The supplied worlds guarantee disjoint prefixes and one app per switch. If malformed information claims the same address at multiple origins, the implementation chooses the lowest origin switch ID so every switch with the same LSDB resolves the conflict identically.
+Routing admits edge A--B only when A's latest LSA names B and B's latest LSA names A. This prevents a one-sided or stale adjacency from carrying traffic.
 
 ## Route computation
 
-For every advertised customer address:
+For every advertised customer address, BFS computes unit-cost distances from its owner over the mutual graph. A switch chooses a live direct neighbor whose distance is exactly one less than its own, breaking ties by neighbor ID and then local port. A local customer has distance zero and uses its customer port.
 
-1. If its origin is this switch, use the recorded local customer port.
-2. Otherwise run breadth-first search on the mutually advertised graph, because all A1 links have equal routing cost.
-3. Choose a live local neighbor whose distance to the destination origin is exactly one less than this switch's distance. Break ties by the smallest neighbor switch ID, then smallest local port ID.
-4. If no such path exists, the address has no desired route.
+For one settled view, every forwarding hop strictly lowers distance:
 
-The strict distance decrease proves that routes computed from one settled LSDB cannot loop: every hop reduces the remaining hop count. It also gives deterministic shortest paths on unseen graphs and arbitrary switch-ID numbering.
+```text
+d, d-1, d-2, ... , 1, 0
+```
 
-The controller diffs desired routes against `installed_routes`:
+Therefore the final FIB for a common view is loop-free. If two LSAs impossibly claim the same customer, the lowest origin ID wins deterministically.
 
-- unchanged route: no action;
-- new route: install once;
-- changed route: delete its stable entry ID, then install the new action;
-- unreachable/withdrawn address: delete the old entry.
+## Why ordinary independent FIB updates were insufficient
 
-Actions are emitted in delete-before-install order because the simulator preserves config-pipe action order. This creates only a serialization-scale miss window and avoids the duplicate-entry behavior of table installs.
+The original implementation installed each switch's new shortest path as soon as that switch learned an LSA. Two switches could temporarily hold routes computed from different views. After a topology change, A could start forwarding to B while B still forwarded to A. The final paths were valid, but packets present during this mixed interval could revisit a switch or die by TTL. The supplied `grid-f002` and `dumb-f003` replays each exposed six such packets.
 
-## Failure detection and recovery
+A fixed quiet-time hold reduced timing differences but could not prove that every switch had the same information or installed dependent routes in the correct order. The current protocol explicitly coordinates both facts.
 
-Proposed timing constants:
+## Routing views and agreement barrier
 
-| Mechanism | Value | Reason |
-|---|---:|---|
-| HELLO/timer interval | 25 ms | Fast detection with negligible bandwidth at A1 scale. |
-| Customer-port classification delay | 50 ms | Gives two hello opportunities and still converges before the 200 ms warmup. |
-| Neighbor dead interval | 100 ms | Four nominal hello periods; tolerant of small scheduling drift and far below the 1,000 ms budget. |
-| SPF stability hold | 5 ms minimum, checked on the next periodic timer | Longer than normal diameter-wide control propagation, while usually adding at most one 25 ms tick. |
+A `ViewId` is a deterministic 128-bit digest of every ordered LSDB record: origin, sequence, neighbor list, and customer list. Matching IDs mean the switches have the same routing input, up to negligible hash-collision risk.
 
-At each timer, a live neighbor whose most recent HELLO is at least 100 ms old is marked down. The switch removes that neighbor from its local LSA, increments the sequence, and floods the replacement. A route whose own next-hop port just died is withdrawn immediately; the complete SPF diff waits until topology information has been stable for at least 5 ms and a timer runs. This favors a short black hole over bouncing a packet back toward an upstream switch.
+For its mutual-graph component, each switch chooses the lowest switch ID as leader and immediately sends READY for its current view. The leader starts only when every member it derives from that same view has sent READY for exactly that view. A view change clears active coordination and causes a new READY. Old-view messages then fail validation.
 
-HELLO transmission continues on down neighbor ports. After link restoration, the first received HELLO marks the adjacency live, increments the local LSA, triggers direct LSDB synchronization, and eventually makes the edge usable once both endpoint LSAs agree.
+This is an agreement barrier, not consensus: the simulator's deterministic, bounded A1 setting does not require durable elections or fault-tolerant replicated state. If a link splits the control graph, each resulting connected component derives its own membership and lowest-ID leader after the relevant LSAs arrive.
 
-Expected practice-world bounds are roughly:
+## Ordered FIB phases
 
-- failure: at most about 100–125 ms to detect and commit new routes, plus sub-millisecond propagation/config time;
-- restoration: normally under 50 ms to hear a hello, exchange LSAs, and commit.
+After the barrier, the leader chooses a monotonically increasing generation and floods phases from 0 through `component_size - 1`.
 
-These are comfortably inside the report card's 1,000 ms limit and leave room for conservative behavior.
+- Phase 0 deletes destinations now unreachable and installs/updates local distance-0 routes.
+- Phase 1 applies routes whose new distance is 1.
+- Phase 2 applies routes whose new distance is 2.
+- Later phases continue outward to the component's maximum possible distance.
 
-## Stale information and loop prevention
+Each switch snapshots desired routes when it accepts the generation. It performs all route actions for a phase before injecting its ACK. Config actions and the ACK share preserved configuration-pipe ordering, so receipt of an ACK implies the route changes were submitted first. The leader advances only after every member ACKs.
 
-The design uses several independent safeguards.
+The safety intuition is destination-rooted: a distance-`d` switch changes only after all distance-`d-1` switches have completed the previous phase. Its new next hop is therefore already prepared. Unreachable old routes are removed first, preferring a brief no-route drop to forwarding into a loop. The official matrix observed 74 such drops across 15 long failure runs, all transient; every destination route returned.
 
-- Origin sequence numbers make duplicate and out-of-order LSAs harmless.
-- Complete replacement LSAs remove stale neighbors and customers rather than accumulating them.
-- Mutual adjacency prevents one stale endpoint claim from resurrecting a link.
-- Periodic anti-entropy repairs a missed flood and synchronizes a recovered edge.
-- A short SPF hold lets an LSA cross the tiny network before FIBs change.
-- Deterministic shortest paths strictly decrease distance after convergence.
-- Failed next-hop routes are deleted before an alternate is installed.
-- Ingress TTL decrement bounds any transient inconsistency that does occur.
+## Loss, duplication, supersession, and liveness
 
-The design guarantees no persistent forwarding loop after the LSDB settles. Like ordinary distributed link-state routing, it cannot make all switches update atomically, so a very short transient loop is possible while config-pipe updates arrive. Thirteen of the 15 Part 2 schedules observed none. Two schedules each observed six packets revisit a switch during convergence; the loops cleared immediately, all required criteria passed, and settled next hops again strictly reduced distance. Avoiding even this transient would require a more complex ordered-update protocol whose extra states and delay are not justified by A1's advisory C3 criterion.
+- READY is retransmitted every 25 ms while routing is dirty.
+- The leader retries an unacknowledged phase every 25 ms with a larger `attempt`.
+- A node re-ACKs duplicate phases it has already completed. A higher attempt is reflooded, repairing a lost phase or ACK path.
+- A full action batch withholds the ACK. On retry, already-applied actions need no space, so remaining actions and then the ACK can progress.
+- A newly accepted LSA immediately cancels active/leader update state and clears phase-flood state. Coordination restarts for the new view.
+- A phase older than `latest_generation[leader]` is rejected. View, leader, generation, phase, component size, and expected phase must all match before a FIB change occurs.
+- Delayed ACKs can only satisfy the leader's exact active generation/view/phase.
 
-## Resource use
+Thus a delayed message from an old topology cannot overwrite newer routing state. Repeated real topology changes can postpone completion by repeatedly superseding work, but once changes stop the retries guarantee progress as long as the component communicates. A rapid-change replay with changes 5--85 ms apart converged with zero loops and a 50 ms worst measured recovery.
 
-- Two tables, no register arrays, no counter arrays.
-- At most one route per customer address (15 in documented A1 scale) in a route table sized for 256 entries.
-- Two TinyVM stages with two instructions and one table access each.
-- Controller state is on the order of `O(V + E + customers)`; SPF is at worst `O(customers * (V + E))` for `V <= 15`.
-- An immediate LSA flood produces at most one packet per live neighbor in one handler.
-- A normal timer emits at most one HELLO plus one anti-entropy LSA per switch-facing port, plus one timer request. Anti-entropy is skipped on a timer that has a large route diff. This keeps the postcard-encoded action vector comfortably below 4,096 bytes even at high degree.
-- Control packets are small and the practice workload uses only a tiny fraction of 1 Gbps. Control traffic is not scored, but it still uses the shared links.
+## Failure and recovery behavior
 
-All decoders and loops have explicit bounds. No handler waits, recurses, or iterates on control-payload list data without a size check.
+The key timings are:
 
-## Alternatives considered
+| Mechanism | Value |
+|---|---:|
+| HELLO/timer interval | 25 ms |
+| Customer classification | 50 ms |
+| Neighbor dead interval | 100 ms |
+| READY/phase retry | 25 ms |
 
-### Distance vector
+On failure, each endpoint eventually sees 100 ms of HELLO silence, marks the neighbor down, immediately deletes installed routes using that failed local port, and originates a newer LSA. Mutual adjacency can disappear as soon as either newer endpoint claim is learned. Once component members agree, the ordered phases install alternate paths.
 
-It needs less topology state, but stale advertisements and count-to-infinity/loop-avoidance rules make failure behavior harder to implement and explain. With only 15 switches, its main advantage is irrelevant.
+On recovery, continued probes cross again. A fresh HELLO marks the port live, replies immediately, syncs the LSDB, and originates a new LSA. The edge is eligible only after both endpoints advertise it; a new view then installs shorter paths in order.
 
-### One spanning tree
+## Resources and measured cost
 
-It is simple in steady state, but loses shortest paths and must rebuild when a tree edge fails. Safe distributed tree replacement is not simpler than flooding LSAs here.
+- Two tables, two TinyVM stages, no registers/counters, and at most one route per observed customer (15 in supplied worlds).
+- Routing work is comfortably bounded at A1 scale. BFS is `O(V+E)` per customer.
+- Action batching reserves timer space and caps estimated output at 3,200 bytes, below the 4,096-byte hard limit.
+- The largest official topology and every update phase ran without output, fuel, table-capacity, action-budget, crash, or panic failures.
+- Release WASM: 204,194 bytes versus 177,327 bytes at the passing checkpoint (+15.2%).
+- Across all 15 Part 2 logs, control ingress-hop count rose from 792,295 to 985,890 (+24.4%) and hop-bytes from 37,356,302 to 50,722,440 (+35.8%). This is about 1.08 Mb/s aggregated over all network links and runs, negligible beside 1 Gb/s links.
 
-### Flooding customer data
+The added complexity and traffic bought zero observed loops, 22.6% fewer losses overall, and equal or faster worst recovery on every supplied schedule.
 
-TinyVM has no multicast action, controller reinjection does not preserve the original workload packet's identity, and flooding would waste bandwidth and risk duplicates. It does not fit the API or scorer.
+## Important assumptions and remaining risks
 
-### Full LSDB in every periodic packet
+- A1's documented bound is 15 switches and supplied worlds remain connected during each single-link failure. The code leaves modest headroom but is not a general Internet routing protocol.
+- Customer prefix length is unobservable; exact observed-host routing matches the simulator's generated destinations. A separate rule requiring arbitrary unseen addresses inside a prefix would need an API source for that prefix.
+- `ViewId` uses two deterministic 64-bit hashes, not a mathematical collision-free LSDB serialization. Collision risk is negligible for A1 but not zero in theory.
+- A permanently failed controller cannot ACK. Its incident links will eventually disappear when neighbors time it out; until the new component view forms, the barrier intentionally waits rather than risk a mixed update.
+- Continuous topology churn can continuously supersede generations. Official schedules leave at least 1,000 ms between changes; the extra rapid-change replay also converged, but an adversary that never stops changing the graph cannot be promised convergence.
+- Brief black holes remain an intentional safety tradeoff during phase 0 and physical link loss.
 
-It converges, but high-degree switches could exceed the 4,096-byte returned-action limit. Immediate delta flooding plus one-record-per-tick anti-entropy is bounded and sufficient.
-
-### Learning `/24` from practice files
-
-All published apps use `/24`, but `PuntEvent` never reveals that length. Advertising the observed `/32` host address is more honest and remains correct for every destination the actual workload generator produces.
-
-## Assumptions and open uncertainties
-
-- The repository itself states in `README.md` that the instructor handout is not included. No handout file exists in this checkout or the task's initial directory. The implementation therefore follows the user's stated requirements plus the executable scorer. The remaining external check is whether the handout requires forwarding every address within a customer prefix rather than the observable workload host address.
-- The docs say the TinyVM program is validated after `init`, but the current `load_program`/`install_program` path does not visibly call `tinyvm::validate`. The implemented two-stage program is within the documented limits and does not rely on this discrepancy.
-- General simulator controllers have `on_link_event`, but A1 disables notifications and the SDK trait deliberately omits it. The design does not rely on it.
-- The practice schedules contain one failed link at a time and guarantee connectivity. The protocol can process multiple independent link losses if the remaining graph stays connected, but that is not the primary tested promise.
-- Switch/CPU failures are implemented by the simulator but do not appear in A1 failure schedules. This design addresses link failures, not a permanently failed node or controller.
+No simulator, scorer, SDK, world, or failure-schedule source is modified by this implementation.

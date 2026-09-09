@@ -7,7 +7,7 @@ use switch_program_sdk::*;
 mod protocol;
 mod routing;
 
-use protocol::{ControlMessage, Hello, Lsa};
+use protocol::{ControlMessage, Hello, Lsa, PhaseAck, Ready, UpdatePhase, ViewId};
 use routing::DesiredRoute;
 
 const T_CONTROL: u32 = 1;
@@ -21,7 +21,7 @@ const CONTROL_SOURCE_BASE: u32 = 0xa9fe_0000;
 const HELLO_INTERVAL_NS: u64 = 25_000_000;
 const PORT_CLASSIFY_NS: u64 = 50_000_000;
 const NEIGHBOR_DEAD_NS: u64 = 100_000_000;
-const SPF_HOLD_NS: u64 = 5_000_000;
+const PHASE_RETRY_NS: u64 = HELLO_INTERVAL_NS;
 
 const ROUTE_TABLE_CAPACITY: u32 = 256;
 
@@ -66,6 +66,28 @@ struct InstalledRoute {
     entry_id: u64,
     port: u16,
     next_hop: Option<u32>,
+}
+
+#[derive(Debug, Clone)]
+struct ActiveUpdate {
+    leader: u32,
+    generation: u64,
+    view: ViewId,
+    max_phase: u32,
+    completed_phase: Option<u32>,
+    desired: BTreeMap<u32, DesiredRoute>,
+}
+
+#[derive(Debug, Clone)]
+struct LeaderUpdate {
+    generation: u64,
+    view: ViewId,
+    members: BTreeSet<u32>,
+    phase: u32,
+    max_phase: u32,
+    attempt: u64,
+    acknowledged: BTreeSet<u32>,
+    last_send_ns: u64,
 }
 
 struct ActionBatch {
@@ -122,8 +144,16 @@ pub struct A1Switch {
     local_customers: BTreeMap<u32, u16>,
     installed_routes: BTreeMap<u32, InstalledRoute>,
     routing_dirty: bool,
-    last_routing_change_ns: u64,
     sync_cursor: usize,
+    ready_sequence: u64,
+    update_generation: u64,
+    announced_view: Option<ViewId>,
+    last_ready_send_ns: u64,
+    ready_by_sender: BTreeMap<u32, Ready>,
+    active_update: Option<ActiveUpdate>,
+    leader_update: Option<LeaderUpdate>,
+    latest_generation: BTreeMap<u32, u64>,
+    seen_phase_attempt: BTreeMap<(u32, u64, u32), u64>,
 }
 
 impl A1Switch {
@@ -143,8 +173,16 @@ impl A1Switch {
             local_customers: BTreeMap::new(),
             installed_routes: BTreeMap::new(),
             routing_dirty: true,
-            last_routing_change_ns: 0,
             sync_cursor: 0,
+            ready_sequence: 0,
+            update_generation: 0,
+            announced_view: None,
+            last_ready_send_ns: 0,
+            ready_by_sender: BTreeMap::new(),
+            active_update: None,
+            leader_update: None,
+            latest_generation: BTreeMap::new(),
+            seen_phase_attempt: BTreeMap::new(),
         }
     }
 
@@ -212,9 +250,12 @@ impl A1Switch {
         }
     }
 
-    fn mark_routing_change(&mut self, now_ns: u64) {
+    fn mark_routing_change(&mut self, _now_ns: u64) {
         self.routing_dirty = true;
-        self.last_routing_change_ns = now_ns;
+        self.announced_view = None;
+        self.active_update = None;
+        self.leader_update = None;
+        self.seen_phase_attempt.clear();
     }
 
     /// Publish a new complete local snapshot only when local facts changed.
@@ -445,9 +486,84 @@ impl A1Switch {
         changed
     }
 
-    fn apply_route_diff(
+    fn view_id(&self) -> ViewId {
+        fn mix(hash: &mut u64, value: u64, multiplier: u64) {
+            *hash ^= value.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            *hash = hash.wrapping_mul(multiplier);
+            *hash ^= *hash >> 29;
+        }
+
+        let mut high = 0xcbf2_9ce4_8422_2325;
+        let mut low = 0x6eed_0e9d_a4d9_4a4f;
+        for (&origin, lsa) in &self.lsdb {
+            for value in [
+                0x4c53_4100_0000_0001,
+                u64::from(origin),
+                lsa.sequence,
+                lsa.neighbors.len() as u64,
+            ] {
+                mix(&mut high, value, 0x0000_0100_0000_01b3);
+                mix(&mut low, value.rotate_left(23), 0x9e37_79b1_85eb_ca87);
+            }
+            for &neighbor in &lsa.neighbors {
+                let value = 0x4e00_0000_0000_0000 | u64::from(neighbor);
+                mix(&mut high, value, 0x0000_0100_0000_01b3);
+                mix(&mut low, value.rotate_left(23), 0x9e37_79b1_85eb_ca87);
+            }
+            mix(&mut high, lsa.customers.len() as u64, 0x0000_0100_0000_01b3);
+            mix(
+                &mut low,
+                (lsa.customers.len() as u64).rotate_left(23),
+                0x9e37_79b1_85eb_ca87,
+            );
+            for &customer in &lsa.customers {
+                let value = 0x4300_0000_0000_0000 | u64::from(customer);
+                mix(&mut high, value, 0x0000_0100_0000_01b3);
+                mix(&mut low, value.rotate_left(23), 0x9e37_79b1_85eb_ca87);
+            }
+        }
+        ViewId { high, low }
+    }
+
+    fn coordination_context(&self) -> (ViewId, BTreeSet<u32>, u32) {
+        let members = routing::component_members(self.switch_id, &self.lsdb);
+        let leader = members.iter().next().copied().unwrap_or(self.switch_id);
+        (self.view_id(), members, leader)
+    }
+
+    fn send_toward(&self, target: u32, payload: Vec<u8>, batch: &mut ActionBatch) -> bool {
+        let Some((_, port)) =
+            routing::next_hop_to(self.switch_id, target, &self.direct_neighbors(), &self.lsdb)
+        else {
+            return false;
+        };
+        self.send_control(port, payload, batch)
+    }
+
+    fn flood_control(&self, payload: Vec<u8>, except_port: Option<u16>, batch: &mut ActionBatch) {
+        for (port, _) in self.live_neighbor_ports() {
+            if Some(port) != except_port {
+                let _ = self.send_control(port, payload.clone(), batch);
+            }
+        }
+    }
+
+    fn desired_routes(&self) -> BTreeMap<u32, DesiredRoute> {
+        routing::desired_routes(
+            self.switch_id,
+            &self.direct_neighbors(),
+            &self.local_customers,
+            &self.lsdb,
+        )
+    }
+
+    /// Apply only the route changes whose new distance equals `phase`.
+    /// Withdrawals have phase zero. The caller acknowledges the phase only
+    /// when every matching action fit in the output budget.
+    fn apply_route_phase(
         &mut self,
         desired: &BTreeMap<u32, DesiredRoute>,
+        phase: u32,
         batch: &mut ActionBatch,
     ) -> bool {
         let keys: BTreeSet<u32> = self
@@ -461,6 +577,15 @@ impl A1Switch {
         for customer in keys {
             let old = self.installed_routes.get(&customer).copied();
             let new = desired.get(&customer).copied();
+            let unchanged = matches!((old, new), (Some(old), Some(new))
+                if old.port == new.port && old.next_hop == new.next_hop);
+            if unchanged || matches!((old, new), (None, None)) {
+                continue;
+            }
+            let route_phase = new.map_or(0, |route| route.distance);
+            if route_phase != phase {
+                continue;
+            }
             match (old, new) {
                 (None, None) => {}
                 (None, Some(route)) => {
@@ -495,9 +620,6 @@ impl A1Switch {
                     }
                 }
                 (Some(old_route), Some(route)) => {
-                    if old_route.port == route.port && old_route.next_hop == route.next_hop {
-                        continue;
-                    }
                     let pair_cost = DELETE_ACTION_ESTIMATE + INSTALL_ACTION_ESTIMATE;
                     if !batch.can_fit(pair_cost) {
                         complete = false;
@@ -529,18 +651,289 @@ impl A1Switch {
         complete
     }
 
-    fn maybe_recompute_routes(&mut self, now_ns: u64, batch: &mut ActionBatch) {
-        if !self.routing_dirty || now_ns.saturating_sub(self.last_routing_change_ns) < SPF_HOLD_NS {
+    fn send_ready(&mut self, now_ns: u64, ready: Ready, batch: &mut ActionBatch) {
+        self.last_ready_send_ns = now_ns;
+        if ready.leader == self.switch_id {
+            self.ready_by_sender.insert(self.switch_id, ready);
+            self.maybe_start_leader_update(now_ns, batch);
+        } else {
+            let _ = self.send_toward(ready.leader, protocol::encode_ready(ready), batch);
+        }
+    }
+
+    fn maybe_announce_ready(&mut self, now_ns: u64, batch: &mut ActionBatch) {
+        if !self.routing_dirty {
             return;
         }
-        let desired = routing::desired_routes(
-            self.switch_id,
-            &self.direct_neighbors(),
-            &self.local_customers,
-            &self.lsdb,
-        );
-        if self.apply_route_diff(&desired, batch) {
+        let (view, _, leader) = self.coordination_context();
+        let is_new = self.announced_view != Some(view);
+        if is_new {
+            self.ready_sequence = self.ready_sequence.saturating_add(1);
+            self.announced_view = Some(view);
+        }
+        if is_new || now_ns.saturating_sub(self.last_ready_send_ns) >= PHASE_RETRY_NS {
+            self.send_ready(
+                now_ns,
+                Ready {
+                    sender: self.switch_id,
+                    leader,
+                    sequence: self.ready_sequence,
+                    view,
+                },
+                batch,
+            );
+        }
+    }
+
+    fn handle_ready(&mut self, now_ns: u64, ready: Ready, batch: &mut ActionBatch) {
+        let (view, members, leader) = self.coordination_context();
+        if self.announced_view != Some(view)
+            || ready.view != view
+            || ready.leader != leader
+            || !members.contains(&ready.sender)
+        {
+            return;
+        }
+        if leader != self.switch_id {
+            let _ = self.send_toward(leader, protocol::encode_ready(ready), batch);
+            return;
+        }
+        let accept = self
+            .ready_by_sender
+            .get(&ready.sender)
+            .is_none_or(|known| ready.sequence >= known.sequence);
+        if accept {
+            self.ready_by_sender.insert(ready.sender, ready);
+            self.maybe_start_leader_update(now_ns, batch);
+        }
+    }
+
+    fn maybe_start_leader_update(&mut self, now_ns: u64, batch: &mut ActionBatch) {
+        if !self.routing_dirty || self.leader_update.is_some() {
+            return;
+        }
+        let (view, members, leader) = self.coordination_context();
+        if leader != self.switch_id || self.announced_view != Some(view) {
+            return;
+        }
+        let all_ready = members.iter().all(|member| {
+            self.ready_by_sender
+                .get(member)
+                .is_some_and(|ready| ready.leader == leader && ready.view == view)
+        });
+        if !all_ready {
+            return;
+        }
+
+        self.update_generation = self.update_generation.saturating_add(1);
+        let max_phase = members.len().saturating_sub(1) as u32;
+        let generation = self.update_generation;
+        self.latest_generation.insert(leader, generation);
+        self.active_update = Some(ActiveUpdate {
+            leader,
+            generation,
+            view,
+            max_phase,
+            completed_phase: None,
+            desired: self.desired_routes(),
+        });
+        self.leader_update = Some(LeaderUpdate {
+            generation,
+            view,
+            members,
+            phase: 0,
+            max_phase,
+            attempt: 0,
+            acknowledged: BTreeSet::new(),
+            last_send_ns: now_ns,
+        });
+        self.launch_current_phase(now_ns, batch);
+    }
+
+    fn phase_message(&self) -> Option<UpdatePhase> {
+        let update = self.leader_update.as_ref()?;
+        Some(UpdatePhase {
+            leader: self.switch_id,
+            generation: update.generation,
+            view: update.view,
+            phase: update.phase,
+            max_phase: update.max_phase,
+            attempt: update.attempt,
+        })
+    }
+
+    fn apply_active_phase(&mut self, phase: UpdatePhase, batch: &mut ActionBatch) -> bool {
+        let Some(active) = self.active_update.as_ref() else {
+            return false;
+        };
+        if active.leader != phase.leader
+            || active.generation != phase.generation
+            || active.view != phase.view
+            || active.max_phase != phase.max_phase
+        {
+            return false;
+        }
+        let expected = active
+            .completed_phase
+            .map_or(0, |done| done.saturating_add(1));
+        if phase.phase < expected {
+            return true;
+        }
+        if phase.phase > expected {
+            return false;
+        }
+        let desired = active.desired.clone();
+        if !self.apply_route_phase(&desired, phase.phase, batch) {
+            return false;
+        }
+        if let Some(active) = self.active_update.as_mut() {
+            active.completed_phase = Some(phase.phase);
+        }
+        true
+    }
+
+    fn launch_current_phase(&mut self, now_ns: u64, batch: &mut ActionBatch) {
+        let Some(phase) = self.phase_message() else {
+            return;
+        };
+        let local_complete = self.apply_active_phase(phase, batch);
+        if let Some(update) = self.leader_update.as_mut() {
+            update.last_send_ns = now_ns;
+            if local_complete {
+                update.acknowledged.insert(self.switch_id);
+            }
+        }
+        self.flood_control(protocol::encode_update_phase(phase), None, batch);
+        self.maybe_advance_phase(now_ns, batch);
+    }
+
+    fn maybe_advance_phase(&mut self, now_ns: u64, batch: &mut ActionBatch) {
+        let complete = self.leader_update.as_ref().is_some_and(|update| {
+            update
+                .members
+                .iter()
+                .all(|member| update.acknowledged.contains(member))
+        });
+        if !complete {
+            return;
+        }
+        let finished = self
+            .leader_update
+            .as_ref()
+            .is_some_and(|update| update.phase >= update.max_phase);
+        if finished {
             self.routing_dirty = false;
+            self.leader_update = None;
+            return;
+        }
+        if let Some(update) = self.leader_update.as_mut() {
+            update.phase += 1;
+            update.attempt = 0;
+            update.acknowledged.clear();
+        }
+        self.launch_current_phase(now_ns, batch);
+    }
+
+    fn handle_update_phase(
+        &mut self,
+        _now_ns: u64,
+        ingress_port: u16,
+        phase: UpdatePhase,
+        batch: &mut ActionBatch,
+    ) {
+        let (view, members, leader) = self.coordination_context();
+        if self.announced_view != Some(view)
+            || phase.view != view
+            || phase.leader != leader
+            || phase.max_phase != members.len().saturating_sub(1) as u32
+            || phase.phase > phase.max_phase
+        {
+            return;
+        }
+        let known_generation = self.latest_generation.get(&leader).copied().unwrap_or(0);
+        if phase.generation < known_generation {
+            return;
+        }
+        if phase.generation > known_generation {
+            self.latest_generation.insert(leader, phase.generation);
+            self.active_update = Some(ActiveUpdate {
+                leader,
+                generation: phase.generation,
+                view,
+                max_phase: phase.max_phase,
+                completed_phase: None,
+                desired: self.desired_routes(),
+            });
+        }
+
+        let key = (leader, phase.generation, phase.phase);
+        let should_flood = self
+            .seen_phase_attempt
+            .get(&key)
+            .is_none_or(|known| phase.attempt > *known);
+        if should_flood {
+            self.seen_phase_attempt.insert(key, phase.attempt);
+        }
+
+        if self.apply_active_phase(phase, batch) {
+            let ack = PhaseAck {
+                sender: self.switch_id,
+                leader,
+                generation: phase.generation,
+                view,
+                phase: phase.phase,
+                attempt: phase.attempt,
+            };
+            let _ = self.send_toward(leader, protocol::encode_phase_ack(ack), batch);
+            if phase.phase == phase.max_phase {
+                self.routing_dirty = false;
+            }
+        }
+        if should_flood {
+            self.flood_control(
+                protocol::encode_update_phase(phase),
+                Some(ingress_port),
+                batch,
+            );
+        }
+    }
+
+    fn handle_phase_ack(&mut self, now_ns: u64, ack: PhaseAck, batch: &mut ActionBatch) {
+        let (view, members, leader) = self.coordination_context();
+        if ack.view != view
+            || ack.leader != leader
+            || !members.contains(&ack.sender)
+            || self.announced_view != Some(view)
+        {
+            return;
+        }
+        if leader != self.switch_id {
+            let _ = self.send_toward(leader, protocol::encode_phase_ack(ack), batch);
+            return;
+        }
+        let Some(update) = self.leader_update.as_mut() else {
+            return;
+        };
+        if ack.generation != update.generation
+            || ack.view != update.view
+            || ack.phase != update.phase
+        {
+            return;
+        }
+        update.acknowledged.insert(ack.sender);
+        self.maybe_advance_phase(now_ns, batch);
+    }
+
+    fn retry_coordination(&mut self, now_ns: u64, batch: &mut ActionBatch) {
+        let retry_phase = self
+            .leader_update
+            .as_ref()
+            .is_some_and(|update| now_ns.saturating_sub(update.last_send_ns) >= PHASE_RETRY_NS);
+        if retry_phase {
+            if let Some(update) = self.leader_update.as_mut() {
+                update.attempt = update.attempt.saturating_add(1);
+            }
+            self.launch_current_phase(now_ns, batch);
         }
     }
 
@@ -613,11 +1006,22 @@ impl SwitchProgram for A1Switch {
                     ControlMessage::Lsa(lsa) => {
                         self.handle_lsa(ev.now_ns, ev.ingress_port, lsa, &mut batch)
                     }
+                    ControlMessage::Ready(ready) => self.handle_ready(ev.now_ns, ready, &mut batch),
+                    ControlMessage::UpdatePhase(phase) => {
+                        self.handle_update_phase(ev.now_ns, ev.ingress_port, phase, &mut batch)
+                    }
+                    ControlMessage::PhaseAck(ack) => {
+                        self.handle_phase_ack(ev.now_ns, ack, &mut batch)
+                    }
                 }
             }
         } else if matches!(ev.reason, PuntReason::NoRoute) {
             self.handle_customer_punt(ev.now_ns, ev.ingress_port, ev.ip_src, &mut batch);
         }
+        // The view-equality barrier makes a separate quiet-time hold
+        // unnecessary. Advertising each newly learned view immediately avoids
+        // adding a full heartbeat of latency for the final LSA.
+        self.maybe_announce_ready(ev.now_ns, &mut batch);
         batch.into_actions()
     }
 
@@ -633,7 +1037,8 @@ impl SwitchProgram for A1Switch {
             let _ = self.refresh_local_lsa(ev.now_ns, &mut batch);
         }
 
-        self.maybe_recompute_routes(ev.now_ns, &mut batch);
+        self.maybe_announce_ready(ev.now_ns, &mut batch);
+        self.retry_coordination(ev.now_ns, &mut batch);
         let had_state_work = batch.has_work();
         self.emit_hellos(&mut batch);
         if !had_state_work {
@@ -781,14 +1186,15 @@ mod tests {
             DesiredRoute {
                 port: 7,
                 next_hop: None,
+                distance: 0,
             },
         )]);
         let mut first = ActionBatch::new(ACTION_BUDGET_BYTES);
-        assert!(program.apply_route_diff(&desired, &mut first));
+        assert!(program.apply_route_phase(&desired, 0, &mut first));
         assert_eq!(first.actions.len(), 1);
 
         let mut second = ActionBatch::new(ACTION_BUDGET_BYTES);
-        assert!(program.apply_route_diff(&desired, &mut second));
+        assert!(program.apply_route_phase(&desired, 0, &mut second));
         assert!(second.actions.is_empty());
     }
 
@@ -797,26 +1203,30 @@ mod tests {
         let customer = 0x0a00_0101;
         let mut program = A1Switch::new(1, vec![7, 8]);
         let mut first = ActionBatch::new(ACTION_BUDGET_BYTES);
-        assert!(program.apply_route_diff(
+        assert!(program.apply_route_phase(
             &BTreeMap::from([(
                 customer,
                 DesiredRoute {
                     port: 7,
                     next_hop: Some(2),
+                    distance: 1,
                 },
             )]),
+            1,
             &mut first,
         ));
 
         let mut changed = ActionBatch::new(ACTION_BUDGET_BYTES);
-        assert!(program.apply_route_diff(
+        assert!(program.apply_route_phase(
             &BTreeMap::from([(
                 customer,
                 DesiredRoute {
                     port: 8,
                     next_hop: Some(3),
+                    distance: 1,
                 },
             )]),
+            1,
             &mut changed,
         ));
         assert!(matches!(
@@ -827,5 +1237,165 @@ mod tests {
             ]
         ));
         assert_eq!(program.installed_routes[&customer].port, 8);
+    }
+
+    #[test]
+    fn route_phase_installs_only_its_distance() {
+        let mut program = A1Switch::new(1, vec![7, 8]);
+        let near = 0x0a00_0101;
+        let far = 0x0a00_0201;
+        let desired = BTreeMap::from([
+            (
+                near,
+                DesiredRoute {
+                    port: 7,
+                    next_hop: Some(2),
+                    distance: 1,
+                },
+            ),
+            (
+                far,
+                DesiredRoute {
+                    port: 8,
+                    next_hop: Some(3),
+                    distance: 2,
+                },
+            ),
+        ]);
+
+        let mut phase_one = ActionBatch::new(ACTION_BUDGET_BYTES);
+        assert!(program.apply_route_phase(&desired, 1, &mut phase_one));
+        assert!(program.installed_routes.contains_key(&near));
+        assert!(!program.installed_routes.contains_key(&far));
+
+        let mut phase_two = ActionBatch::new(ACTION_BUDGET_BYTES);
+        assert!(program.apply_route_phase(&desired, 2, &mut phase_two));
+        assert!(program.installed_routes.contains_key(&far));
+    }
+
+    #[test]
+    fn leader_waits_for_every_ready_then_advances_on_every_ack() {
+        let customer = 0x0a00_0201;
+        let mut program = A1Switch::new(1, vec![7]);
+        program.ports.get_mut(&7).unwrap().role = PortRole::Switch {
+            neighbor_id: 2,
+            live: true,
+        };
+        program.lsdb.insert(1, Lsa::new(1, 1, vec![2], vec![]));
+        program
+            .lsdb
+            .insert(2, Lsa::new(2, 1, vec![1], vec![customer]));
+        let (view, _, leader) = program.coordination_context();
+        assert_eq!(leader, 1);
+        program.announced_view = Some(view);
+        program.ready_by_sender.insert(
+            1,
+            Ready {
+                sender: 1,
+                leader,
+                sequence: 1,
+                view,
+            },
+        );
+
+        let mut batch = ActionBatch::new(ACTION_BUDGET_BYTES);
+        program.maybe_start_leader_update(10, &mut batch);
+        assert!(program.leader_update.is_none());
+
+        program.handle_ready(
+            11,
+            Ready {
+                sender: 2,
+                leader,
+                sequence: 1,
+                view,
+            },
+            &mut batch,
+        );
+        assert_eq!(program.leader_update.as_ref().map(|u| u.phase), Some(0));
+        assert!(!program.installed_routes.contains_key(&customer));
+
+        let generation = program.leader_update.as_ref().unwrap().generation;
+        program.handle_phase_ack(
+            12,
+            PhaseAck {
+                sender: 2,
+                leader,
+                generation,
+                view,
+                phase: 0,
+                attempt: 0,
+            },
+            &mut batch,
+        );
+        assert_eq!(program.leader_update.as_ref().map(|u| u.phase), Some(1));
+        assert_eq!(program.installed_routes[&customer].next_hop, Some(2));
+
+        let actions_before_retry = batch.actions.len();
+        program.retry_coordination(12 + PHASE_RETRY_NS, &mut batch);
+        assert_eq!(program.leader_update.as_ref().map(|u| u.attempt), Some(1));
+        assert!(batch.actions.len() > actions_before_retry);
+    }
+
+    #[test]
+    fn newer_lsa_cancels_an_in_progress_update() {
+        let mut program = A1Switch::new(4, vec![]);
+        let view = program.view_id();
+        program.active_update = Some(ActiveUpdate {
+            leader: 4,
+            generation: 1,
+            view,
+            max_phase: 0,
+            completed_phase: None,
+            desired: BTreeMap::new(),
+        });
+        program.leader_update = Some(LeaderUpdate {
+            generation: 1,
+            view,
+            members: BTreeSet::from([4]),
+            phase: 0,
+            max_phase: 0,
+            attempt: 0,
+            acknowledged: BTreeSet::new(),
+            last_send_ns: 10,
+        });
+
+        program.mark_routing_change(20);
+        assert!(program.routing_dirty);
+        assert!(program.active_update.is_none());
+        assert!(program.leader_update.is_none());
+        assert!(program.announced_view.is_none());
+    }
+
+    #[test]
+    fn stale_phase_cannot_replace_a_newer_generation() {
+        let mut program = A1Switch::new(4, vec![]);
+        let view = program.view_id();
+        program.announced_view = Some(view);
+        program.latest_generation.insert(4, 2);
+        program.active_update = Some(ActiveUpdate {
+            leader: 4,
+            generation: 2,
+            view,
+            max_phase: 0,
+            completed_phase: Some(0),
+            desired: BTreeMap::new(),
+        });
+        let mut batch = ActionBatch::new(ACTION_BUDGET_BYTES);
+        program.handle_update_phase(
+            100,
+            0,
+            UpdatePhase {
+                leader: 4,
+                generation: 1,
+                view,
+                phase: 0,
+                max_phase: 0,
+                attempt: 99,
+            },
+            &mut batch,
+        );
+        assert_eq!(program.active_update.as_ref().unwrap().generation, 2);
+        assert!(batch.actions.is_empty());
     }
 }

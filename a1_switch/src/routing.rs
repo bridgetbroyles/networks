@@ -11,6 +11,9 @@ pub struct DesiredRoute {
     pub port: u16,
     /// `None` means the destination is attached to this switch.
     pub next_hop: Option<u32>,
+    /// Distance to the customer origin in the LSDB view used to compute this
+    /// route. Ordered FIB updates install smaller distances first.
+    pub distance: u32,
 }
 
 /// Construct an undirected graph containing an edge only when both latest
@@ -53,6 +56,38 @@ pub fn distances_from(origin: u32, graph: &Graph) -> BTreeMap<u32, u32> {
     distances
 }
 
+pub fn component_members(self_id: u32, lsdb: &BTreeMap<u32, Lsa>) -> BTreeSet<u32> {
+    distances_from(self_id, &mutual_graph(lsdb))
+        .into_keys()
+        .collect()
+}
+
+/// Choose a local port on a shortest path to `target`. Coordination traffic
+/// uses this instead of flooding every acknowledgement.
+pub fn next_hop_to(
+    self_id: u32,
+    target: u32,
+    direct_neighbors: &[(u32, u16)],
+    lsdb: &BTreeMap<u32, Lsa>,
+) -> Option<(u32, u16)> {
+    if self_id == target {
+        return None;
+    }
+    let graph = mutual_graph(lsdb);
+    let distances = distances_from(target, &graph);
+    let my_distance = *distances.get(&self_id)?;
+    direct_neighbors
+        .iter()
+        .copied()
+        .filter(|(neighbor, _)| {
+            graph
+                .get(&self_id)
+                .is_some_and(|adjacent| adjacent.contains(neighbor))
+                && distances.get(neighbor).copied() == Some(my_distance - 1)
+        })
+        .min_by_key(|(neighbor, port)| (*neighbor, *port))
+}
+
 /// Lowest origin ID wins an impossible/conflicting customer claim so that all
 /// switches with the same LSDB make the same choice.
 fn customer_origins(lsdb: &BTreeMap<u32, Lsa>) -> BTreeMap<u32, u32> {
@@ -83,6 +118,7 @@ pub fn desired_routes(
                     DesiredRoute {
                         port,
                         next_hop: None,
+                        distance: 0,
                     },
                 );
             }
@@ -113,6 +149,7 @@ pub fn desired_routes(
                 DesiredRoute {
                     port,
                     next_hop: Some(neighbor),
+                    distance: my_distance,
                 },
             );
         }
@@ -151,7 +188,9 @@ mod tests {
         let r20 = desired_routes(20, &[(10, 1), (30, 2)], &local, &db);
         assert_eq!(r10[&customer].next_hop, Some(20));
         assert_eq!(r10[&customer].port, 7);
+        assert_eq!(r10[&customer].distance, 2);
         assert_eq!(r20[&customer].next_hop, Some(30));
+        assert_eq!(r20[&customer].distance, 1);
     }
 
     #[test]
@@ -179,7 +218,22 @@ mod tests {
             DesiredRoute {
                 port: 100,
                 next_hop: None,
+                distance: 0,
             }
         );
+    }
+
+    #[test]
+    fn component_and_control_next_hop_use_the_mutual_graph() {
+        let mut db = BTreeMap::new();
+        db.insert(1, lsa(1, &[2], &[]));
+        db.insert(2, lsa(2, &[1, 3], &[]));
+        db.insert(3, lsa(3, &[2], &[]));
+        db.insert(9, lsa(9, &[], &[]));
+
+        assert_eq!(component_members(3, &db), BTreeSet::from([1, 2, 3]));
+        assert_eq!(next_hop_to(3, 1, &[(2, 7)], &db), Some((2, 7)));
+        assert_eq!(next_hop_to(1, 1, &[(2, 4)], &db), None);
+        assert_eq!(next_hop_to(1, 9, &[(2, 4)], &db), None);
     }
 }

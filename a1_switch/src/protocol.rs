@@ -4,6 +4,9 @@ const MAGIC: &[u8; 4] = b"NA1!";
 const VERSION: u8 = 1;
 const TYPE_HELLO: u8 = 1;
 const TYPE_LSA: u8 = 2;
+const TYPE_READY: u8 = 3;
+const TYPE_PHASE: u8 = 4;
+const TYPE_PHASE_ACK: u8 = 5;
 
 /// A1 documents at most 15 switches. This larger bound leaves room for
 /// hand-written tests while keeping hostile/corrupt payload work bounded.
@@ -21,6 +24,40 @@ pub struct Lsa {
     pub sequence: u64,
     pub neighbors: Vec<u32>,
     pub customers: Vec<u32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ViewId {
+    pub high: u64,
+    pub low: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Ready {
+    pub sender: u32,
+    pub leader: u32,
+    pub sequence: u64,
+    pub view: ViewId,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UpdatePhase {
+    pub leader: u32,
+    pub generation: u64,
+    pub view: ViewId,
+    pub phase: u32,
+    pub max_phase: u32,
+    pub attempt: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PhaseAck {
+    pub sender: u32,
+    pub leader: u32,
+    pub generation: u64,
+    pub view: ViewId,
+    pub phase: u32,
+    pub attempt: u64,
 }
 
 impl Lsa {
@@ -48,6 +85,9 @@ impl Lsa {
 pub enum ControlMessage {
     Hello(Hello),
     Lsa(Lsa),
+    Ready(Ready),
+    UpdatePhase(UpdatePhase),
+    PhaseAck(PhaseAck),
 }
 
 fn put_header(out: &mut Vec<u8>, kind: u8) {
@@ -84,6 +124,45 @@ pub fn encode_lsa(lsa: &Lsa) -> Option<Vec<u8>> {
         out.extend_from_slice(&customer.to_le_bytes());
     }
     Some(out)
+}
+
+fn put_view(out: &mut Vec<u8>, view: ViewId) {
+    out.extend_from_slice(&view.high.to_le_bytes());
+    out.extend_from_slice(&view.low.to_le_bytes());
+}
+
+pub fn encode_ready(ready: Ready) -> Vec<u8> {
+    let mut out = Vec::with_capacity(38);
+    put_header(&mut out, TYPE_READY);
+    out.extend_from_slice(&ready.sender.to_le_bytes());
+    out.extend_from_slice(&ready.leader.to_le_bytes());
+    out.extend_from_slice(&ready.sequence.to_le_bytes());
+    put_view(&mut out, ready.view);
+    out
+}
+
+pub fn encode_update_phase(phase: UpdatePhase) -> Vec<u8> {
+    let mut out = Vec::with_capacity(50);
+    put_header(&mut out, TYPE_PHASE);
+    out.extend_from_slice(&phase.leader.to_le_bytes());
+    out.extend_from_slice(&phase.generation.to_le_bytes());
+    put_view(&mut out, phase.view);
+    out.extend_from_slice(&phase.phase.to_le_bytes());
+    out.extend_from_slice(&phase.max_phase.to_le_bytes());
+    out.extend_from_slice(&phase.attempt.to_le_bytes());
+    out
+}
+
+pub fn encode_phase_ack(ack: PhaseAck) -> Vec<u8> {
+    let mut out = Vec::with_capacity(54);
+    put_header(&mut out, TYPE_PHASE_ACK);
+    out.extend_from_slice(&ack.sender.to_le_bytes());
+    out.extend_from_slice(&ack.leader.to_le_bytes());
+    out.extend_from_slice(&ack.generation.to_le_bytes());
+    put_view(&mut out, ack.view);
+    out.extend_from_slice(&ack.phase.to_le_bytes());
+    out.extend_from_slice(&ack.attempt.to_le_bytes());
+    out
 }
 
 struct Cursor<'a> {
@@ -123,6 +202,13 @@ impl<'a> Cursor<'a> {
         let mut bytes = [0u8; 8];
         bytes.copy_from_slice(self.take(8)?);
         Some(u64::from_le_bytes(bytes))
+    }
+
+    fn view(&mut self) -> Option<ViewId> {
+        Some(ViewId {
+            high: self.u64()?,
+            low: self.u64()?,
+        })
     }
 
     fn finished(&self) -> bool {
@@ -172,6 +258,39 @@ pub fn decode(bytes: &[u8]) -> Option<ControlMessage> {
                 origin, sequence, neighbors, customers,
             )))
         }
+        TYPE_READY => {
+            let ready = Ready {
+                sender: cursor.u32()?,
+                leader: cursor.u32()?,
+                sequence: cursor.u64()?,
+                view: cursor.view()?,
+            };
+            cursor.finished().then_some(ControlMessage::Ready(ready))
+        }
+        TYPE_PHASE => {
+            let phase = UpdatePhase {
+                leader: cursor.u32()?,
+                generation: cursor.u64()?,
+                view: cursor.view()?,
+                phase: cursor.u32()?,
+                max_phase: cursor.u32()?,
+                attempt: cursor.u64()?,
+            };
+            cursor
+                .finished()
+                .then_some(ControlMessage::UpdatePhase(phase))
+        }
+        TYPE_PHASE_ACK => {
+            let ack = PhaseAck {
+                sender: cursor.u32()?,
+                leader: cursor.u32()?,
+                generation: cursor.u64()?,
+                view: cursor.view()?,
+                phase: cursor.u32()?,
+                attempt: cursor.u64()?,
+            };
+            cursor.finished().then_some(ControlMessage::PhaseAck(ack))
+        }
         _ => None,
     }
 }
@@ -218,6 +337,50 @@ mod tests {
         let mut trailing = valid;
         trailing.push(0);
         assert_eq!(decode(&trailing), None);
+    }
+
+    #[test]
+    fn coordination_messages_round_trip() {
+        let view = ViewId {
+            high: 0x1122,
+            low: 0x3344,
+        };
+        let ready = Ready {
+            sender: 7,
+            leader: 2,
+            sequence: 9,
+            view,
+        };
+        assert_eq!(
+            decode(&encode_ready(ready)),
+            Some(ControlMessage::Ready(ready))
+        );
+
+        let phase = UpdatePhase {
+            leader: 2,
+            generation: 11,
+            view,
+            phase: 3,
+            max_phase: 8,
+            attempt: 4,
+        };
+        assert_eq!(
+            decode(&encode_update_phase(phase)),
+            Some(ControlMessage::UpdatePhase(phase))
+        );
+
+        let ack = PhaseAck {
+            sender: 7,
+            leader: 2,
+            generation: 11,
+            view,
+            phase: 3,
+            attempt: 4,
+        };
+        assert_eq!(
+            decode(&encode_phase_ack(ack)),
+            Some(ControlMessage::PhaseAck(ack))
+        );
     }
 
     #[test]

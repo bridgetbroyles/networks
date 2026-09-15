@@ -1,303 +1,222 @@
-# Assignment 1 test plan
+# Assignment 1 test plan and final results
 
-This plan is for the future Rust/WASM implementation. Phase 1 does not build or run a student switch.
+The purpose of testing is not only to make the report card green. It must show discovery completes, final routes are correct, failures and recoveries converge, coordination cannot install stale state, and safety does not cause a permanent black hole.
 
-## Test objectives
+## Success criteria
 
-Testing must establish more than a passing whole-run percentage:
+- Part 1: C1 at least 99.9%, complete C2 reachability, zero steady-state loss, ideally zero C3 loops.
+- Part 2: C1 at least 98%, complete C2, zero persistent or transient loops, and all C4 events at most 1,000 ms.
+- No panic, WASM trap, fuel exhaustion, invalid output, action-budget overflow, frozen controller, or table-capacity failure.
+- Every withdrawn route is reinstalled when reachable again.
+- Old, duplicate, or out-of-order control information cannot replace newer decisions.
 
-- complete discovery before the 200 ms scored window;
-- delivery for every ordered app pair;
-- stable, loop-free forwarding when all links are healthy;
-- sub-1,000 ms response to every failure and every restoration;
-- rejection of stale, duplicate, malformed, and out-of-order control data;
-- no duplicate/stale forwarding entries;
-- no WASM trap, fuel exhaustion, or output-size failure;
-- bounded, understandable control overhead.
+## Build and unit tests
 
-## Environment preflight
+Final verification on 2026-09-09:
 
-Before implementation testing:
+- A1 crate: 21 tests passed, 0 failed.
+- Repository/SDK/simulator workspace: 93 tests passed, 0 failed; two ignored doctests.
+- Release WASM build: passed for `wasm32-unknown-unknown`.
+- Formatting check: passed.
 
-1. Confirm `cargo`, `rustc`, and `rustup` are available.
-2. Install/check `wasm32-unknown-unknown`.
-3. Build the simulator in release mode.
-4. Run the repository's existing test suite before student-code changes.
-5. Confirm Git is clean except for intentional documentation/program work.
+The A1 tests cover:
 
-The current Phase 1 shell environment does not have `cargo` on `PATH`, so this preflight could not yet be completed. That is an environment issue, not a repository test result.
+- HELLO, LSA, READY, UPDATE_PHASE, and PHASE_ACK round trips;
+- malformed/truncated/oversized payload rejection;
+- strict HELLO/LSA freshness;
+- delayed customer classification;
+- timeout and fresh-HELLO recovery;
+- mutual graph, sparse component, control next hop, deterministic tie break, and decreasing BFS distance;
+- unchanged-route suppression and delete-before-install replacement;
+- distance-specific phase application;
+- all-member READY and ACK barriers;
+- phase retry;
+- cancellation by a newer LSA;
+- rejection of an older generation after a newer one is active.
 
-## Unit tests inside the program crate
+## Part 1 practice worlds
 
-### Protocol codec
+| World | Shape / scale | Delivery | Reachability | Loops / TTL | Result |
+|---|---|---:|---:|---:|---|
+| `practice-ring-002` | ring, 6 switches | 100.00%, 0/5,814 lost | 30/30 | 0 / 0 | PASS |
+| `practice-hub-009` | hub, 7 switches | 100.00%, 0/6,783 lost | 42/42 | 0 / 0 | PASS |
+| `practice-grid-003` | grid, 10 switches | 100.00%, 0/9,690 lost | 90/90 | 0 / 0 | PASS |
+| `practice-dumb-006` | dumbbell, 13 switches | 100.00%, 0/12,597 lost | 156/156 | 0 / 0 | PASS |
+| `practice-ring-010` | ring/chords, 15 switches | 100.00%, 0/14,535 lost | 210/210 | 0 / 0 | PASS |
 
-Test round trips for smallest and largest expected HELLO/LSA messages. Test rejection of:
+What this establishes:
 
-- wrong magic or version;
-- unknown message type;
-- truncated header or list;
-- declared count larger than remaining payload;
-- count beyond the configured maximum;
-- trailing garbage, if the format requires exact consumption.
+- startup HELLOs distinguish every inter-switch port before the 50 ms customer decision;
+- all customer addresses and LSAs spread before the 200 ms scoring window;
+- readiness barriers do not deadlock during startup;
+- every ordered pair obtains a route;
+- larger diameter and 15-switch state remain within resource limits.
 
-The decoder must return `None`/an error, never panic.
+Expected unscored startup behavior: early route misses are punted and lost while customer locations are being learned. They are not evidence of a forwarding failure after warmup.
 
-### Freshness rules
+## Part 2 failure schedules
 
-- first LSA for an origin is accepted;
-- higher sequence replaces it;
-- equal sequence is ignored and not reflooded;
-- lower sequence is ignored;
-- received self-origin LSA is ignored;
-- a replacement snapshot removes a neighbor/customer absent from the new list.
+Every supplied schedule contains six failure intervals and therefore 12 scored DOWN/UP events.
 
-### Port classification
+| Schedule | Delivery (lost/total) | Reachability | Loops / TTL | Events | Worst | No route |
+|---|---:|---:|---:|---:|---:|---:|
+| `part2-dumb-006-f001` | 99.54% (149/32,071) | 156/156 | 0 / 0 | 12/12 | 128 ms | 1 |
+| `part2-dumb-006-f002` | 99.61% (125/32,071) | 156/156 | 0 / 0 | 12/12 | 117 ms | 5 |
+| `part2-dumb-006-f003` | 99.64% (116/32,435) | 156/156 | 0 / 0 | 12/12 | 105 ms | 5 |
+| `part2-grid-003-f001` | 99.57% (116/27,110) | 90/90 | 0 / 0 | 12/12 | 108 ms | 4 |
+| `part2-grid-003-f002` | 99.64% (95/26,660) | 90/90 | 0 / 0 | 12/12 | 98 ms | 1 |
+| `part2-grid-003-f003` | 99.56% (103/23,390) | 90/90 | 0 / 0 | 12/12 | 123 ms | 4 |
+| `part2-hub-009-f001` | 99.61% (63/15,995) | 42/42 | 0 / 0 | 12/12 | 98 ms | 0 |
+| `part2-hub-009-f002` | 99.61% (70/18,130) | 42/42 | 0 / 0 | 12/12 | 95 ms | 7 |
+| `part2-hub-009-f003` | 99.64% (65/18,025) | 42/42 | 0 / 0 | 12/12 | 90 ms | 0 |
+| `part2-ring-002-f001` | 99.58% (65/15,636) | 30/30 | 0 / 0 | 12/12 | 112 ms | 1 |
+| `part2-ring-002-f002` | 99.61% (59/14,940) | 30/30 | 0 / 0 | 12/12 | 112 ms | 4 |
+| `part2-ring-002-f003` | 99.67% (51/15,366) | 30/30 | 0 / 0 | 12/12 | 116 ms | 2 |
+| `part2-ring-010-f001` | 99.60% (148/36,720) | 210/210 | 0 / 0 | 12/12 | 135 ms | 14 |
+| `part2-ring-010-f002` | 99.65% (139/39,630) | 210/210 | 0 / 0 | 12/12 | 145 ms | 19 |
+| `part2-ring-010-f003` | 99.65% (134/37,875) | 210/210 | 0 / 0 | 12/12 | 121 ms | 7 |
 
-- HELLO maps the exact ingress port to the sender.
-- Ordinary traffic on an unknown port creates a candidate, not immediate customer state.
-- HELLO before the classification deadline prevents customer classification.
-- A known switch port never learns a transit packet's source as local.
-- A customer port can learn its observed source address.
-- A later HELLO can correct a tentative misclassification.
-
-### Topology graph
-
-- one-sided adjacency is excluded;
-- mutual adjacency is included;
-- withdrawal from either endpoint removes the edge;
-- sparse/non-zero-based switch IDs work;
-- disconnected input yields no route rather than a panic.
-
-### Routing
-
-Use line, triangle, diamond, ring, and disconnected graphs.
-
-- Local customer route uses the local port.
-- Remote route takes a shortest path.
-- Every selected neighbor has distance exactly one less to the destination.
-- Equal-cost tie-break is deterministic.
-- No route is produced without a path or known local neighbor port.
-- Duplicate customer claims resolve deterministically.
-
-For every small generated graph, follow the chosen next hops and assert that distance strictly decreases until the origin. This directly tests the no-persistent-loop invariant.
-
-### Route diffs
-
-- empty to populated emits one install per address;
-- unchanged emits nothing;
-- changed port emits delete then install;
-- withdrawn address emits delete;
-- mixed changes preserve deterministic action order;
-- repeated recomputation does not grow the table.
-
-### Timing state
-
-- one missing HELLO does not fail a neighbor;
-- 100 ms of silence does;
-- comparisons use event times despite timer drift;
-- down ports keep receiving outgoing HELLO probes;
-- recovered HELLO changes liveness and originates a newer LSA;
-- SPF waits for the stability hold.
-
-## Native simulator/integration tests
-
-Build small in-memory topologies or temporary world files without changing grader code.
-
-### Startup timeline
-
-Log a three-switch line from 0–250 ms. Success means:
-
-- HELLOs identify all inter-switch ports;
-- only genuine access ports learn customers;
-- all customer LSAs reach all switches;
-- route entries are installed before 200 ms;
-- losses occur only during warmup;
-- no route duplicates appear in the viewer.
-
-### Silent failure
-
-On a triangle, fail the direct link used by one route at a non-timer-aligned time. Success means:
-
-- no `on_link_event` dependency;
-- the local endpoint keeps trying HELLOs;
-- the link is removed after the liveness timeout;
-- a replacement path is installed well inside 1,000 ms;
-- traffic remains stable afterward.
-
-### Recovery
-
-Restore that link at a jittered time. Success means:
-
-- a later HELLO, not a schedule assumption, detects recovery;
-- both endpoint LSAs must advertise it before use;
-- routes may return to the shorter path;
-- no persistent loop or stale failed-port route remains.
-
-### Control-message disorder
-
-Where practical, inject LSAs directly into a controller test in orders such as `5, 7, 6, 7`. The final stored version must be 7 and flooding must be bounded. Repeat an accepted LSA many times and verify no action storm.
-
-### Resource/high-degree case
-
-Use a 15-switch high-degree topology. Record the maximum encoded handler output and approximate fuel. Success means every call remains comfortably below 4,096 bytes and 4,000,000 instructions; optional anti-entropy is skipped when route/flood work is large.
-
-## Part 1 practice matrix
-
-Every world uses 1 Gbps links, 100 microsecond latency, 65,536-byte queues, 10 ms per-app traffic, a 200 ms warmup, a 10,000 ms run, and a 99.9% delivery floor.
-
-| World | Shape | Switches / links / apps | Diameter | What it stresses | Success |
-|---|---|---:|---:|---|---|
-| `practice-ring-002.toml` | ring with chords | 6 / 9 / 6 | 2 | Small first end-to-end case; equal paths | C1/C2 pass; C3 ideally zero; no baseline loss |
-| `practice-hub-009.toml` | dual-hub/spoke | 7 / 11 / 7 | 2 | High-degree ports and deterministic ties | Same, with no output-size issue |
-| `practice-grid-003.toml` | grid | 10 / 13 / 10 | 5 | Longer LSA spread and several equal paths | Same; all 90 ordered pairs reachable |
-| `practice-dumb-006.toml` | dumbbell | 13 / 15 / 13 | 6 | Sparse cut-like structure and long routes | Same; all 156 ordered pairs reachable |
-| `practice-ring-010.toml` | large ring/chords | 15 / 18 / 15 | 6 | Maximum documented state and route count | Same; all 210 ordered pairs reachable, no resource warnings |
-
-Run the smallest world first, then sweep all five. A correct Part 1 report should show:
-
-- C1 at or very near 100%, above 99.9%;
-- C2 exactly `N*(N-1)` reached;
-- C3 zero revisits/TTL deaths if possible;
-- C4 `n/a` because no link event occurred;
-- no `WHERE PACKETS STOPPED`, `WHAT WENT WRONG`, `INTEGRITY`, or program-failure section for scored traffic.
-
-Inspect startup separately with a shorter run/log; a perfect unscored total is not expected because learning punts are discarded.
-
-## Part 2 failure matrix
-
-Part 2 twins have the same graphs but a 60,000 ms nominal world duration and 98% delivery floor. When a schedule is supplied, its roughly 23–27 second duration wins. Every schedule has six non-overlapping failure intervals, therefore 12 scored state-change events, and a 1,000 ms recovery budget.
-
-Run all three schedules for every topology:
-
-| World | Schedules | Main stress |
-|---|---|---|
-| `part2-ring-002.toml` | `f001`, `f002`, `f003` | Frequent equal-cost alternatives in a small graph |
-| `part2-hub-009.toml` | `f001`, `f002`, `f003` | High-degree hubs; every published blast radius is 1 |
-| `part2-grid-003.toml` | `f001`, `f002`, `f003` | Multiple alternate paths and mixed blast radii |
-| `part2-dumb-006.toml` | `f001`, `f002`, `f003` | Large blast radii up to 20 and diameter 6 |
-| `part2-ring-010.toml` | `f001`, `f002`, `f003` | 15-switch scale, diameter 6, blast radius up to 21 |
-
-For every run, success means:
-
-- C1 at least 98%;
-- C2 every ordered app pair reached;
-- C4 `12/12 events recovered within 1000 ms`;
-- each recovery-timeline row says `ok`;
-- no steady-state `baseline_loss` outside event windows;
-- no controller failure;
-- no persistent loop after convergence;
-- restored links are actually rediscovered and may be selected again.
-
-Do not test only failures with small blast radius. The dumbbell and large-ring schedules are especially valuable because one wrong next hop affects many source/destination pairs.
+All 15 runs passed every displayed criterion. Across them, 180/180 events recovered, no program failed, and no route stayed absent. The maximum recovery is only 14.5% of the allowed budget.
 
 ## Focused behavior checks
 
-### Normal forwarding
+### Normal forwarding and route invariant
 
-Pick one source/destination pair and inspect its route at every hop. The chosen next hop must be live and one distance closer to the customer's origin. The final switch must select its customer port.
+For any destination, reconstruct the owner and BFS distances from the logged table state. Every installed nonlocal next hop should be adjacent and have a distance one smaller. The destination owner should forward to its customer port. This proves settled routes cannot loop.
 
-### Warmup
+### Startup and warmup
 
-Compare logs at 25, 50, 100, and 200 ms. By 200 ms, all customers and routes should be present. If not, do not hide the problem by increasing the scorer's warmup override.
+Inspect 0, 25, 50, 100, and 200 ms:
 
-### Topology discovery
+1. HELLOs identify switch ports.
+2. Ordinary punts create customer candidates.
+3. At 50 ms, candidates become local customers and LSAs change.
+4. Identical views produce READY messages.
+5. Distance phases install routes outward.
+6. At 200 ms, all scored pairs forward without punts.
 
-For every switch, reconstruct the expected neighbor-to-port mapping from the world declaration order and compare it with HELLO observations in debug output/log-derived behavior. The program itself must not use that expected mapping.
+Do not increase warmup to hide incomplete discovery.
 
-### Customer discovery
+### Topology and customer discovery
 
-Verify that each switch advertises its app's first-host address and that no switch advertises a remote source as local. Confirm the route table uses exact host keys.
+- Verify neighbor IDs are learned from HELLO ingress, not world filenames or port numbering.
+- Verify local LSAs change only when local facts change.
+- Verify only traffic from unknown/customer ports is learned locally; a no-route transit packet on a switch port must not become a false customer.
+- Verify exact entries use observed addresses because prefix length is absent from the API.
 
 ### Link failure
 
-Measure:
+For a DOWN event, inspect:
 
-- failure event to last accepted in-flight HELLO;
-- last HELLO to local timeout;
-- timeout to LSA arrival at farthest switch;
-- LSA arrival to route-table change;
-- event to last lost workload packet (the report-card value).
-
-### Route changes
-
-Inspect table logs around a changed route. There should be one delete followed by one install, not accumulating entries. Unchanged destinations should not be rewritten.
+- last fresh HELLO and 100 ms timeout;
+- immediate deletion of routes using the dead local port;
+- newer endpoint LSA and removal of mutual adjacency;
+- cancellation of any older update;
+- common-view READY barrier;
+- phase 0 withdrawals, then increasing-distance installs;
+- report-card time of the last lost packet.
 
 ### Link recovery
 
-Confirm HELLOs were attempted while the link was down, the first post-restore HELLO is observed, both endpoint LSAs advance, and the mutual graph admits the edge only after both claims arrive.
+Confirm HELLOs continued while down, a fresh sequence arrived after restore, the endpoint replied/synchronized, both endpoint LSAs restored mutual adjacency, and ordered phases installed the recovered shorter paths. UP events must pass C4 just like DOWN events.
 
-### Stale and duplicate information
+### Stale, duplicate, and out-of-order information
 
-Unit/integration tests should show old LSAs cannot overwrite new ones, duplicates are not reflooded, and periodic anti-entropy can restore a deliberately omitted record.
+Checks must establish:
 
-### Loops
+- equal/older HELLOs do not refresh liveness;
+- equal/older LSAs do not replace or reflood an origin;
+- READY must match current component leader and exact view;
+- an older generation cannot replace a newer active update;
+- out-of-order phases are rejected;
+- a duplicate completed phase can be re-ACKed but does not repeat route actions;
+- delayed ACKs cannot advance a different generation/view/phase;
+- a new LSA supersedes in-progress coordination immediately.
 
-Use C3 plus packet traces. Any repeated switch after the recovery window is a correctness bug. A transient repeat should trigger inspection of the SPF hold and update ordering even though C3 is advisory.
+### Loops and black holes
+
+C3 and packet-hop analysis must both report zero repeated switches and zero TTL deaths. A no-route punt is not automatically a bug: phase 0 intentionally withdraws unsafe paths. It is a bug if reachability does not return, C2 is incomplete, loss continues beyond C4, or a route is never reinstalled.
+
+Final official totals were 74 temporary no-route punts among 1,498 losses. All reachability and C4 checks passed. The two checkpoint loop regressions changed from six loops each to zero.
+
+### Coordination liveness and action limits
+
+- Look for a leader stuck on one phase, repeated attempts without ACK completion, or `routing_dirty` that never clears.
+- Verify a retry reaches branches missed by an earlier flooded attempt.
+- On the 15-switch world, verify no 4,096-byte output, instruction, or table-capacity failure.
+- If a route batch does not fit, confirm no ACK is sent; retry should apply only remaining diffs and then ACK.
+
+No such failure appeared in the official matrix.
+
+## Rapid-change stress test
+
+A temporary harness, outside the repository, used the existing `part2-grid-003` world and unmodified simulator. It changed links 5--85 ms apart so a new view could supersede a barrier or phase already in flight.
+
+Result: 98.22% delivery, 90/90 reachability, zero loops/TTL, 6/6 events within budget, 50 ms worst recovery, zero no-route losses, and no program failure. This covers failure during coordination, recovery during coordination, rapid successive views, and multiple path lengths.
+
+The official failure parser intentionally requires nonoverlapping changes at least 1,000 ms apart, so this test calls the existing simulator's public fail/restore operations directly rather than altering schedules or validation rules.
+
+## Performance comparison
+
+- Checkpoint losses: 1,935; ordered implementation: 1,498 (-22.6%).
+- Recovery: improved on 14 schedules and tied on one; new worst is 145 ms.
+- Loops: 12 total checkpoint observations across two schedules; zero now.
+- Control ingress hops: +24.4%; control hop-bytes: +35.8%.
+- Release WASM size: +15.2%.
+
+This means the safety improvement did not buy zero loops by causing excessive loss or slower convergence. The additional control work is modest at A1 scale.
 
 ## Report-card interpretation
 
-- **C1 failure:** too many scored packets were lost. Separate baseline loss from failure-attributed loss.
-- **C2 failure:** at least one ordered pair never delivered. Start with the named pair and example path; often one customer origin or local route is missing.
-- **C3 note:** a packet revisited a switch or died by TTL. Inspect mixed old/new routes and stale next hops.
-- **C4 failure:** at least one DOWN or UP event's last loss was more than 1,000 ms after the event. Use the exact row, link, and example packet.
-- **Program failed:** fix this before interpreting routing symptoms. The data plane freezes at the moment of a trap/fuel/output error.
-- **Integrity warning:** do not forge workload-like packets and verify the run/world/schedule combination.
-
-Remember that C4 defines recovery as the time of the **last lost packet sent** after an event, not the first subsequent success. With round-robin traffic, the measurement is quantized by when an affected source/destination pair next sends.
+- **C1 failure:** separate failed-link/queue loss from no-route loss and look for prolonged silence.
+- **C2 failure:** identify the missing ordered pair and trace the destination's customer LSA and distance phases.
+- **C3 failure:** inspect mixed route generations and repeated hop sequence.
+- **C4 failure:** inspect the exact DOWN/UP row; recovery is the last lost packet's send time, not merely the first later success.
+- **Program failed:** resolve the trap/fuel/output issue before interpreting routing symptoms; the data plane otherwise freezes at its old state.
 
 ## Logs and replay viewer
 
-For any suspicious run, keep a named `.simlog` rather than relying on the temporary score log. Use the browser viewer to:
+Keep one uniquely named `.simlog` per run. The automatic scratch name is world-based and collides if schedules for the same world run concurrently.
 
-- pause just before and after a failure;
-- inspect each switch's current route table;
-- confirm the failed link rendering;
-- follow a report-card example packet;
-- look for repeated hops;
-- verify delete/install order and restored-link reuse.
+Use the scorer and viewer to inspect:
 
-The generic log does not include control payload bytes, so detailed HELLO/LSA decoding may require temporary, bounded debug state/tests. Do not modify the simulator log schema for the assignment.
+- report-card example packets;
+- failed/recovered links;
+- table delete/install order and timestamps;
+- whether a route is absent briefly or permanently;
+- repeated switch hops and TTL deaths;
+- reuse of restored links.
 
-## Suggested command sequence for implementation phase
+Control payload bytes are not included in the generic log, so exact protocol-state assertions belong in unit tests or a temporary external analyzer, not simulator modifications.
 
-After choosing `PROGRAM` as the built WASM path:
+## Reproducible command outline
 
 ```sh
-cargo test --all-targets
-
-./target/release/competitive_net_sim run-world \
-  worlds/practice/practice-ring-002.toml \
-  --program "$PROGRAM" --score --log /tmp/a1-part1.simlog
+cargo test --manifest-path a1_switch/Cargo.toml
+cargo build --release --target wasm32-unknown-unknown \
+  --manifest-path a1_switch/Cargo.toml
+cargo test --workspace
 
 for world in worlds/practice/practice-*.toml; do
-  ./target/release/competitive_net_sim run-world \
-    "$world" --program "$PROGRAM" --score
+  competitive_net_sim run-world "$world" --program "$PROGRAM" --score
 done
 
 for schedule in worlds/practice/failures/*.toml; do
-  stem=$(basename "$schedule" | sed -E 's/-f[0-9]+\.toml$//')
-  ./target/release/competitive_net_sim run-world \
-    "worlds/practice/${stem}.toml" \
-    --failures "$schedule" --program "$PROGRAM" --score
+  # Derive its matching part2 world and give every run a unique --log path.
+  competitive_net_sim run-world "$WORLD" --failures "$schedule" \
+    --program "$PROGRAM" --score --log "$UNIQUE_LOG"
 done
 ```
 
-The final sweep should be rerun from a clean release build. Save at least one passing Part 1 and one demanding Part 2 log for quiz review.
+## Hidden-world risks to retain in final review
 
-## Hidden-world risk tests
+- shuffled/sparse switch IDs and ties;
+- largest diameter/component and high-degree nodes;
+- topology change just before/after HELLO timeout or phase retry;
+- dropped control flood/ACK;
+- component leader removed by a failure;
+- repeated supersession that eventually stops;
+- multiple simultaneous failures if the graph remains connected;
+- any assignment interpretation requiring unseen addresses inside a prefix.
 
-Before submission, add local tests for conditions not strongly represented by the five published graphs:
-
-- sparse and shuffled switch IDs;
-- a 15-switch high-degree node;
-- several equal-cost routes;
-- a link failing just before/after a timer;
-- restoration just before/after a HELLO attempt;
-- one dropped immediate LSA flood packet;
-- repeated stale LSA delivery;
-- malformed control payloads;
-- multiple simultaneous link losses while the graph remains connected (best-effort robustness, even if not promised);
-- a customer prefix length other than `/24`, confirming exact first-host routing still serves generated workloads.
-
-The key hidden-world defense is to derive everything from observed ports, HELLOs, LSAs, and packet addresses rather than published IDs, filenames, topology families, failure times, or port 100.
-
+The code derives behavior only from observable ports, messages, packet addresses, and time. It does not key on practice topology names, switch numbering patterns, failure times, or the known app port.
